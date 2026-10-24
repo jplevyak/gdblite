@@ -1,0 +1,7 @@
+[package]
+name = "gdblite"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight graph database built on an append-only record log"
+
+[dependencies]
