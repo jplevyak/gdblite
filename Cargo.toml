@@ -5,3 +5,10 @@ edition = "2024"
 description = "A lightweight graph database built on an append-only record log"
 
 [dependencies]
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "record_log"
+harness = false

@@ -814,4 +814,74 @@ mod tests {
         assert_eq!(reopened.next_id(size), next);
         assert_eq!(reopened.body_size(next), Some(size - HEADER_SIZE));
     }
+
+    /// Writes tuples of `lens` ids taken in order from `ids` in place into a
+    /// log starting at `start_id` until `n` ids are written, then decodes them
+    /// all back.  `ids` must hold at least `n + lens.end() - 1` ids.
+    fn round_trip_in_place(
+        start_id: u64,
+        n: usize,
+        ids: &[u64],
+        lens: std::ops::RangeInclusive<usize>,
+        rng: &mut XorShift,
+    ) {
+        // Every tuple holds at least one id, so `max_tuple_len(1)` per id is
+        // enough room.
+        let mut buf = vec![0u8; HEADER_SIZE + max_tuple_len(1) * ids.len()];
+        let mut log = RecordLog::make(&mut buf[..], start_id).unwrap();
+        let span = (lens.end() - lens.start() + 1) as u64;
+        let mut tuples = Vec::new();
+        let mut id = start_id;
+        let mut last = 0;
+        while last < n {
+            let len = lens.start() + (rng.next() % span) as usize;
+            let extra = rng.next() & 1 == 1;
+            tuples.push((id, last, len, extra));
+            id = log.make_tuple(id, extra, &ids[last..last + len]).unwrap();
+            last += len;
+        }
+        let end = id;
+
+        let mut id = start_id;
+        let mut out = Vec::new();
+        for &(tuple_id, first, len, extra) in &tuples {
+            assert_eq!(id, tuple_id);
+            assert_eq!(log.tuple_len(id).unwrap(), len);
+            out.clear();
+            let (got_extra, next) = log.decode_tuple(id, &mut out).unwrap();
+            assert_eq!(got_extra, extra);
+            assert_eq!(out, &ids[first..first + len]);
+            id = next;
+        }
+        assert_eq!(id, end);
+    }
+
+    /// Ported from the C++ RecordLogRandom test: skewed ids, so small and
+    /// large values are both common, in tuples of 1 to 15 ids.
+    #[test]
+    fn random_skewed_round_trip() {
+        let n = 100_000;
+        let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+        // Ids are limited to 63 bits, the most `encode_field` accepts.
+        let ids: Vec<u64> = (0..n + 15)
+            .map(|_| {
+                let bits = rng.next() % 64;
+                rng.next() & ((1u64 << bits) - 1)
+            })
+            .collect();
+        round_trip_in_place(1, n, &ids, 1..=15, &mut rng);
+    }
+
+    /// Ported from the C++ RecordLogCompressDecompressVersion1 test, without
+    /// the compression step: ids uniform below `start_id`, so every id is a
+    /// back reference, in tuples of 6 to 15 ids.
+    #[test]
+    fn random_back_reference_round_trip() {
+        let n = 100_000;
+        let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+        let ids: Vec<u64> = (0..n + 15)
+            .map(|_| 1 + rng.next() % (n as u64 - 1))
+            .collect();
+        round_trip_in_place(n as u64, n, &ids, 6..=15, &mut rng);
+    }
 }

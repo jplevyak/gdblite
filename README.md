@@ -119,6 +119,8 @@ src/
   record_log.rs  RecordLog, PersistentHeader, Entry, Value, Tuple
   coder.rs       tagged / group variable integers and id encoding
   error.rs       Error and Result
+benches/
+  record_log.rs  encode/decode benchmarks
 reference/       original C++ sources the record log was ported from
 ```
 
@@ -128,7 +130,9 @@ reference/       original C++ sources the record log was ported from
 cargo build
 cargo test          # unit tests, plus the example in this README
 cargo clippy --all-targets
+cargo bench         # record log encode/decode benchmarks (criterion)
 cargo doc --open
 ```
 
-gdblite has no dependencies outside the Rust standard library.
+gdblite has no runtime dependencies outside the Rust standard library;
+[criterion](https://crates.io/crates/criterion) is used for benchmarks only.
