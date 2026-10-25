@@ -6,10 +6,22 @@
 //! linking earlier entries together).
 
 pub mod coder;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod dynamic_table;
 mod error;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod local;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod local_record_log;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod local_table;
+#[cfg(all(unix, target_pointer_width = "64"))]
+mod mmap;
+pub mod record;
 pub mod record_log;
 
 pub use error::{Error, Result};
+pub use record::{Link, LinkFields, LinkState, Linkage, Record, RecordSet, Uuid};
 pub use record_log::{Compression, Entry, PersistentHeader, RecordLog, Tuple, Value};
 
 // Compile and run the examples in the README.

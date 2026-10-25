@@ -451,7 +451,8 @@ impl<B: AsRef<[u8]>> RecordLog<B> {
         Ok(offset)
     }
 
-    fn entry_bytes(&self, id: u64) -> Result<&[u8]> {
+    /// The bytes from the entry at `id` to the end of the log.
+    pub fn entry_bytes(&self, id: u64) -> Result<&[u8]> {
         let bytes = &self.as_bytes()[self.offset(id)?..];
         if bytes.is_empty() {
             return Err(Error::IdOutOfRange);

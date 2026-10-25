@@ -14,6 +14,8 @@ pub enum Error {
     IdOutOfRange,
     /// The entry is a tuple where a value was expected, or vice versa.
     KindMismatch,
+    /// A link field refers to an id at or after the link itself.
+    ForwardReference,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -26,6 +28,7 @@ impl fmt::Display for Error {
             Error::Overflow => "integer overflow",
             Error::IdOutOfRange => "id out of range",
             Error::KindMismatch => "entry kind mismatch",
+            Error::ForwardReference => "link refers forward",
         })
     }
 }

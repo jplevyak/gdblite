@@ -5,6 +5,8 @@ edition = "2024"
 description = "A lightweight graph database built on an append-only record log"
 
 [dependencies]
+libc = "0.2.191"
+sha2 = "0.10.9"
 
 [dev-dependencies]
 criterion = "0.8.2"

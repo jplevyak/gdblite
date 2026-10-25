@@ -7,8 +7,12 @@ nodes, values and tuples where every entry is addressed by its position in the
 log. Edges are tuples of ids pointing back at earlier entries, encoded relative
 to the tuple's own position so that nearby references take only a byte or two.
 
-> **Status:** early development. The record log storage format is in place;
-> the graph query layer is still to come.
+A persistent **dynamic table** (an on-disk hash table) maps 64 or 128 bit keys
+to lists of `u64` values, for use as an index.
+
+> **Status:** early development. The storage layer (record log, dynamic table,
+> and a local database combining a file-backed log with index tables) is in
+> place; the graph query layer is still to come.
 
 ## Data model
 
@@ -69,7 +73,44 @@ All decoding is bounds checked. A truncated or corrupt log returns an
 `Error` and never reads out of bounds. `Entry::complete_len` and
 `Tuple::estimate_len` help when you consume a log that is still arriving.
 
-## On-disk format
+## Dynamic table
+
+`dynamic_table` is a persistent hash table from a key (`key`, plus an optional
+`key2` for 128 bit keys) to an extra bit and a list of non-zero `u64` values.
+It has one `Writer` and any number of `Reader`s, which take no locks and can
+look up keys on other threads while the writer inserts.
+
+```rust
+use gdblite::dynamic_table::{Options, Writer};
+
+// Pass Some(path_prefix) for a table on disk, or None for one in memory.
+let mut table = Writer::open(None, Options::default()).unwrap();
+table.insert(42, 0, false, &[7, 8]).unwrap();  // append values
+table.insert(42, 0, true, &[9]).unwrap();
+table.replace(43, 99, false, &[1]).unwrap();   // replace a 128 bit key's values
+table.delete(43, 99).unwrap();
+
+let reader = table.reader();                   // Clone + Send + Sync
+let found = reader.get(42, 0).unwrap();
+assert_eq!((found.bit, found.values), (true, vec![7, 8, 9]));
+assert!(reader.get(43, 99).is_none());
+```
+
+Each level of the table is a file of 128 byte buckets. Each level has twice as
+many buckets as the one before. A key's operations are appended to its bucket
+as compact varint records, and each bucket links to an overflow bucket when it
+fills. When too many buckets overflow, the table moves to the next level a few
+buckets at a time. Each level is mapped at a fixed address with room reserved to
+grow, so growing never moves memory that readers are using. An old level is
+unmapped `Options::retire_delay` after the move finishes (5 minutes by default).
+
+It is ported from a C++ original in `reference/`, with its bugs fixed: deletes
+no longer corrupt later records, re-inserts no longer truncate buckets, a key
+can hold any number of values, readers survive file growth, and an interrupted
+expansion resumes. It runs on 64-bit Unix only, and one process at a time; a
+lock file stops a second writer.
+
+## Record log format
 
 All multi-byte integers are little endian.
 
@@ -115,13 +156,21 @@ encoder picks whichever is smaller, so ids must be at most `i64::MAX`.
 
 ```text
 src/
-  lib.rs         crate root and public re-exports
-  record_log.rs  RecordLog, PersistentHeader, Entry, Value, Tuple
-  coder.rs       tagged / group variable integers and id encoding
-  error.rs       Error and Result
+  lib.rs              crate root and public re-exports
+  record_log.rs       RecordLog, PersistentHeader, Entry, Value, Tuple
+  record.rs           Record (an entry and its id), links, RecordSet
+  coder.rs            tagged / group variable integers and id encoding
+  error.rs            Error and Result
+  mmap.rs             memory mapping and file helpers
+  dynamic_table/      persistent hash table: Writer, Reader (mod.rs), record
+                      format, tests
+  local_record_log.rs record log in memory mapped files, with commits and
+                      snapshots (tests in local_record_log/)
+  local_table.rs      index from ids or uuids to id sets, on a dynamic table
+  local.rs            local database: a log plus index tables (tests in local/)
 benches/
-  record_log.rs  encode/decode benchmarks
-reference/       original C++ sources the record log was ported from
+  record_log.rs       encode/decode benchmarks
+reference/            original C++ sources ported to Rust
 ```
 
 ## Building and testing
@@ -134,5 +183,6 @@ cargo bench         # record log encode/decode benchmarks (criterion)
 cargo doc --open
 ```
 
-gdblite has no runtime dependencies outside the Rust standard library;
+gdblite's runtime dependencies are [libc](https://crates.io/crates/libc), for
+memory mapping, and [sha2](https://crates.io/crates/sha2), for value uuids.
 [criterion](https://crates.io/crates/criterion) is used for benchmarks only.
