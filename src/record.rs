@@ -117,6 +117,16 @@ impl Uuid {
     }
 }
 
+impl From<u64> for Uuid {
+    /// The uuid of an id, as a table key: `{ uuid0: id, uuid1: 0 }`.
+    fn from(id: u64) -> Self {
+        Uuid {
+            uuid0: id,
+            uuid1: 0,
+        }
+    }
+}
+
 /// The current time as a [`LinkTime`].
 pub fn now() -> LinkTime {
     SystemTime::now()

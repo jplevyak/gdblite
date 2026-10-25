@@ -19,6 +19,8 @@ pub mod local_table;
 mod mmap;
 pub mod record;
 pub mod record_log;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod tuple_index;
 
 pub use error::{Error, Result};
 pub use record::{Link, LinkFields, LinkState, Linkage, Record, RecordSet, Uuid};

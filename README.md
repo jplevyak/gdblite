@@ -168,6 +168,8 @@ src/
                       snapshots (tests in local_record_log/)
   local_table.rs      index from ids or uuids to id sets, on a dynamic table
   local.rs            local database: a log plus index tables (tests in local/)
+  tuple_index.rs      built-in graph indexes: links by linkage, values, SPO,
+                      intersections, compounds (tests in tuple_index/)
 benches/
   record_log.rs       encode/decode benchmarks
 reference/            original C++ sources ported to Rust

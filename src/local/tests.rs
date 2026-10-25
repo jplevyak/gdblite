@@ -50,6 +50,14 @@ fn three_indexes() -> Options {
     }
 }
 
+/// Options that add no tables, so an existing database's are just found.
+fn existing() -> Options {
+    Options {
+        tables: 0,
+        ..Options::default()
+    }
+}
+
 /// What a populated database should hold.
 #[derive(Default)]
 struct Expected {
@@ -162,7 +170,7 @@ fn reopen() {
         local.commit().unwrap();
     }
     // The indexes are found without being asked for.
-    let mut local = Local::open(Some(&prefix), Options::default()).unwrap();
+    let mut local = Local::open(Some(&prefix), existing()).unwrap();
     assert_eq!(local.table_count(), 4);
     assert_eq!(local.table(3).find_one(5u64), Some(6));
     check(&local, &expected);
@@ -170,10 +178,7 @@ fn reopen() {
     populate(&mut local, &mut rng, 100, &mut expected);
     local.commit().unwrap();
     drop(local);
-    check(
-        &Local::open(Some(&prefix), Options::default()).unwrap(),
-        &expected,
-    );
+    check(&Local::open(Some(&prefix), existing()).unwrap(), &expected);
 
     remove(&prefix).unwrap();
     assert!(!exists(&prefix));
@@ -198,7 +203,7 @@ fn uncommitted_index_entries_name_filler() {
             .set(Uuid::of(b"lost"), lost)
             .unwrap();
     }
-    let mut local = Local::open(Some(&prefix), Options::default()).unwrap();
+    let mut local = Local::open(Some(&prefix), existing()).unwrap();
     // The index entry survived, but names a node rather than any new entry.
     assert_eq!(local.table(VALUES).find_one(Uuid::of(b"lost")), Some(lost));
     assert!(local.log().get(lost).unwrap().is_node());
@@ -225,37 +230,30 @@ fn snapshot() {
     drop(local);
 
     let copy = dir.prefix("copy");
-    let restored = Local::restore(Some(&copy), Options::default(), &mut &bytes[..]).unwrap();
+    let restored = Local::restore(Some(&copy), existing(), &mut &bytes[..]).unwrap();
     assert_eq!(restored.table_count(), 3);
     check(&restored, &expected);
     drop(restored);
-    check(
-        &Local::open(Some(&copy), Options::default()).unwrap(),
-        &expected,
-    );
+    check(&Local::open(Some(&copy), existing()).unwrap(), &expected);
 
     // Not over an existing database.
-    let err = Local::restore(Some(&copy), Options::default(), &mut &bytes[..]);
+    let err = Local::restore(Some(&copy), existing(), &mut &bytes[..]);
     assert!(matches!(err, Err(Error::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists));
 
     // A truncated or extended snapshot fails, leaving nothing behind.
     let bad = dir.prefix("bad");
-    let err = Local::restore(
-        Some(&bad),
-        Options::default(),
-        &mut &bytes[..bytes.len() - 1],
-    );
+    let err = Local::restore(Some(&bad), existing(), &mut &bytes[..bytes.len() - 1]);
     assert!(err.is_err());
     assert!(!exists(&bad));
     assert!(!local_table::exists(&index_prefix(&bad, 0)));
     let mut extended = bytes.clone();
     extended.push(0);
-    let err = Local::restore(Some(&bad), Options::default(), &mut &extended[..]);
+    let err = Local::restore(Some(&bad), existing(), &mut &extended[..]);
     assert!(matches!(err, Err(Error::InvalidFormat(_))));
     assert!(!exists(&bad));
     let mut corrupt = bytes;
     corrupt[0] ^= 1;
-    let err = Local::restore(None, Options::default(), &mut &corrupt[..]);
+    let err = Local::restore(None, existing(), &mut &corrupt[..]);
     assert!(matches!(err, Err(Error::InvalidFormat(_))));
 }
 
@@ -278,10 +276,10 @@ fn transient_snapshot() {
 
     let dir = TempDir::new("transient-snapshot");
     let prefix = dir.prefix("db");
-    let restored = Local::restore(Some(&prefix), Options::default(), &mut &bytes[..]).unwrap();
+    let restored = Local::restore(Some(&prefix), existing(), &mut &bytes[..]).unwrap();
     assert!(!restored.is_transient());
     drop(restored);
-    let local = Local::open(Some(&prefix), Options::default()).unwrap();
+    let local = Local::open(Some(&prefix), existing()).unwrap();
     assert_eq!(local.log().records(local.log().start_id()).count(), 2000);
 }
 
@@ -290,6 +288,7 @@ fn sizing() {
     let options = Options::for_tuples(1000);
     assert_eq!(options.log.create_size, 1000 * LOG_BYTES_PER_TUPLE);
     assert_eq!(options.index.create_size, 1000 * INDEX_BYTES_PER_TUPLE);
+    assert_eq!(options.tables, crate::tuple_index::NUM_BUILTIN_INDEXES);
     let local = Local::open(None, options).unwrap();
-    assert_eq!(local.table_count(), 0);
+    assert_eq!(local.table_count(), crate::tuple_index::NUM_BUILTIN_INDEXES);
 }

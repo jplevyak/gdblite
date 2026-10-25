@@ -30,6 +30,7 @@ use crate::dynamic_table;
 use crate::local_record_log::{self, LocalRecordLog};
 use crate::local_table::{self, LocalTable};
 use crate::mmap::suffixed;
+use crate::tuple_index::NUM_BUILTIN_INDEXES;
 
 /// Rough sizes for preallocating a database from its expected tuple count.
 const LOG_BYTES_PER_TUPLE: u64 = 30;
@@ -93,7 +94,7 @@ impl From<dynamic_table::Error> for Error {
 }
 
 /// Options for opening a database.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Options {
     pub log: local_record_log::Options,
     /// The options for each index.
@@ -101,6 +102,17 @@ pub struct Options {
     /// The number of index tables a database has at least: an existing
     /// database with fewer is given more.
     pub tables: usize,
+}
+
+impl Default for Options {
+    /// Room for the [built-in indexes](crate::tuple_index::BuiltinIndex).
+    fn default() -> Self {
+        Options {
+            log: local_record_log::Options::default(),
+            index: dynamic_table::Options::default(),
+            tables: NUM_BUILTIN_INDEXES,
+        }
+    }
 }
 
 impl Options {
