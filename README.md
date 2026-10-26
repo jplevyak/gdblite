@@ -70,8 +70,10 @@ local ones.
 ## Queries
 
 `query::Query` matches triple patterns over variables against the live links,
-with filters, a selection, a limit and `as_of`. `plan` orders the patterns
-by estimated cost, from index counts and the graph's statistics, choosing a
+with unions, negation (`not`, like SPARQL's `FILTER NOT EXISTS`), filters,
+`distinct`, ordering by id or by value data, a limit, and `as_of` for the
+query or for each pattern. `plan` orders the patterns and unions by
+estimated cost, from index counts and the graph's statistics, choosing a
 bind join (an index lookup per row) or a hash join for each; `execute`
 streams the rows in batches.
 

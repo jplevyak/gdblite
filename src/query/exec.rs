@@ -4,10 +4,11 @@
 //! far are meaningful.  Each operator fills a batch with up to
 //! [`BATCH_ROWS`] rows on request, and an empty batch means it is done.
 
-use std::collections::{BTreeSet, HashMap};
+use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::plan::{Access, Join, Plan, shared_vars};
-use super::{Filter, Pattern, Term, Var};
+use super::plan::{Access, GroupPlan, Join, Plan, Step};
+use super::{Filter, Pattern, SortKey, Term, Var};
 use crate::graph::{Graph, Result};
 use crate::local_table::IdSet;
 use crate::record::Linkage;
@@ -62,16 +63,53 @@ trait Operator {
     fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()>;
 }
 
-/// A single row binding nothing.
-struct Unit {
-    done: bool,
+/// Runs `op` to the end, appending its rows to `out`.
+fn drain(op: &mut dyn Operator, g: &Graph, out: &mut Batch) -> Result<()> {
+    let mut batch = Batch::new(out.width);
+    loop {
+        batch.clear();
+        op.next(g, &mut batch)?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        out.data.extend_from_slice(&batch.data);
+    }
 }
 
-impl Operator for Unit {
+/// Given rows, once.
+struct Seed {
+    rows: Option<Batch>,
+}
+
+impl Operator for Seed {
     fn next(&mut self, _: &Graph, out: &mut Batch) -> Result<()> {
-        if !self.done {
-            self.done = true;
-            out.data.resize(out.width, 0);
+        if let Some(rows) = self.rows.take() {
+            out.data = rows.data;
+        }
+        Ok(())
+    }
+}
+
+/// A single row binding nothing.
+fn unit(width: usize) -> Box<dyn Operator> {
+    let mut row = Batch::new(width);
+    row.data.resize(width, 0);
+    Box::new(Seed { rows: Some(row) })
+}
+
+/// The rows of each operator in turn.
+struct Concat {
+    ops: Vec<Box<dyn Operator>>,
+}
+
+impl Operator for Concat {
+    fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
+        while let Some(op) = self.ops.first_mut() {
+            op.next(g, out)?;
+            if !out.is_empty() {
+                return Ok(());
+            }
+            self.ops.remove(0);
         }
         Ok(())
     }
@@ -238,16 +276,17 @@ impl Operator for BindJoin {
     }
 }
 
-/// Rows joined on their shared variables to the rows of a pattern, scanned
-/// once into a hash table.
+/// Rows joined on `keys` to the rows of another operator, read once into a
+/// hash table.
 struct HashJoin {
     probe: Box<dyn Operator>,
-    /// The scan of the pattern, until the table is built.
+    /// The other rows, until the table is built.
     build: Option<Box<dyn Operator>>,
     keys: Vec<Var>,
-    /// The variables the pattern binds that the probe rows do not.
+    /// The variables the other rows bind that the probe rows do not.
     new_vars: Vec<Var>,
-    /// The values of `new_vars` of each scanned row, by its key values.
+    /// The values of `new_vars` of each other row, by its key values; with
+    /// no new variables, a 0 for each row.
     table: HashMap<Vec<u64>, Vec<u64>>,
     in_batch: Batch,
     in_pos: usize,
@@ -264,33 +303,30 @@ impl HashJoin {
         let Some(mut build) = self.build.take() else {
             return Ok(());
         };
-        let mut batch = Batch::new(self.in_batch.width);
-        loop {
-            batch.clear();
-            build.next(g, &mut batch)?;
-            if batch.is_empty() {
-                return Ok(());
+        let mut rows = Batch::new(self.in_batch.width);
+        drain(build.as_mut(), g, &mut rows)?;
+        for i in 0..rows.len() {
+            let row = rows.row(i);
+            let values = self.table.entry(self.key(row)).or_default();
+            if self.new_vars.is_empty() {
+                values.push(0);
             }
-            for i in 0..batch.len() {
-                let row = batch.row(i);
-                let values = self.table.entry(self.key(row)).or_default();
-                values.extend(self.new_vars.iter().map(|v| row[v.0]));
-            }
+            values.extend(self.new_vars.iter().map(|v| row[v.0]));
         }
+        Ok(())
     }
 }
 
 impl Operator for HashJoin {
     fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
         self.build_table(g)?;
-        let n = self.new_vars.len();
+        let stride = self.new_vars.len().max(1);
         loop {
             if let Some((i, mut pos)) = self.current {
                 let mut new = self.in_batch.row(i).to_vec();
                 let key = self.key(&new);
                 let values = &self.table[&key];
-                // With no new variables, a matching key is one match.
-                while pos < values.len() || (n == 0 && pos == 0) {
+                while pos < values.len() {
                     if out.is_full() {
                         self.current = Some((i, pos));
                         return Ok(());
@@ -299,7 +335,7 @@ impl Operator for HashJoin {
                         new[v.0] = values[pos + k];
                     }
                     out.push(&new);
-                    pos += n.max(1);
+                    pos += stride;
                 }
                 self.current = None;
             }
@@ -318,6 +354,112 @@ impl Operator for HashJoin {
             self.in_pos += 1;
             if self.table.contains_key(&self.key(self.in_batch.row(i))) {
                 self.current = Some((i, 0));
+            }
+        }
+    }
+}
+
+/// The rows of a union's branches, evaluated for each batch of input rows.
+struct UnionBind {
+    input: Box<dyn Operator>,
+    branches: Vec<GroupPlan>,
+    bound: Vec<bool>,
+    ctx: Context,
+    pending: Batch,
+    pending_pos: usize,
+}
+
+impl Operator for UnionBind {
+    fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
+        loop {
+            while self.pending_pos < self.pending.len() {
+                if out.is_full() {
+                    return Ok(());
+                }
+                out.push(self.pending.row(self.pending_pos));
+                self.pending_pos += 1;
+            }
+            let mut rows = Batch::new(out.width);
+            self.input.next(g, &mut rows)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            self.pending.clear();
+            self.pending_pos = 0;
+            for branch in &self.branches {
+                let seed = Box::new(Seed {
+                    rows: Some(rows.clone()),
+                });
+                let mut op = self.ctx.build(branch, seed, &mut self.bound.clone());
+                drain(op.as_mut(), g, &mut self.pending)?;
+            }
+        }
+    }
+}
+
+/// The rows for which a group has no match, given their values of `keys`.
+/// For each batch, the group is evaluated for its rows; or, if `once` is
+/// set, it is evaluated once alone.
+struct AntiJoin {
+    input: Box<dyn Operator>,
+    group: GroupPlan,
+    keys: Vec<Var>,
+    bound: Vec<bool>,
+    ctx: Context,
+    /// For evaluating once: the keys with a match, once known.
+    once: Option<Option<HashSet<Vec<u64>>>>,
+}
+
+impl AntiJoin {
+    /// The keys of the rows the group has a match for, evaluated for `rows`
+    /// (or alone, if `rows` is `None`).
+    fn matched(&self, g: &Graph, rows: Option<&Batch>) -> Result<HashSet<Vec<u64>>> {
+        let (seed, mut bound): (Box<dyn Operator>, Vec<bool>) = match rows {
+            Some(rows) => (
+                Box::new(Seed {
+                    rows: Some(rows.clone()),
+                }),
+                self.bound.clone(),
+            ),
+            None => (unit(self.ctx.width), vec![false; self.bound.len()]),
+        };
+        let mut op = self.ctx.build(&self.group, seed, &mut bound);
+        let mut matches = Batch::new(self.ctx.width);
+        drain(op.as_mut(), g, &mut matches)?;
+        Ok((0..matches.len())
+            .map(|i| self.keys.iter().map(|v| matches.row(i)[v.0]).collect())
+            .collect())
+    }
+}
+
+impl Operator for AntiJoin {
+    fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
+        if let Some(None) = self.once {
+            self.once = Some(Some(self.matched(g, None)?));
+        }
+        loop {
+            let mut rows = Batch::new(out.width);
+            self.input.next(g, &mut rows)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let fresh;
+            let matched = match &self.once {
+                Some(Some(m)) => m,
+                _ => {
+                    fresh = self.matched(g, Some(&rows))?;
+                    &fresh
+                }
+            };
+            for i in 0..rows.len() {
+                let row = rows.row(i);
+                let key: Vec<u64> = self.keys.iter().map(|v| row[v.0]).collect();
+                if !matched.contains(&key) {
+                    out.push(row);
+                }
+            }
+            if !out.is_empty() {
+                return Ok(());
             }
         }
     }
@@ -351,6 +493,88 @@ impl Operator for FilterOp {
     }
 }
 
+/// The first row with each value of `keys`.
+struct Distinct {
+    input: Box<dyn Operator>,
+    keys: Vec<Var>,
+    seen: HashSet<Vec<u64>>,
+    batch: Batch,
+}
+
+impl Operator for Distinct {
+    fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
+        loop {
+            self.batch.clear();
+            self.input.next(g, &mut self.batch)?;
+            if self.batch.is_empty() {
+                return Ok(());
+            }
+            for i in 0..self.batch.len() {
+                let row = self.batch.row(i);
+                if self
+                    .seen
+                    .insert(self.keys.iter().map(|v| row[v.0]).collect())
+                {
+                    out.push(row);
+                }
+            }
+            if !out.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// All the rows, in order.
+struct Sort {
+    input: Option<Box<dyn Operator>>,
+    keys: Vec<SortKey>,
+    rows: Batch,
+    pos: usize,
+}
+
+impl Sort {
+    fn compare(g: &Graph, keys: &[SortKey], a: &[u64], b: &[u64]) -> Ordering {
+        for k in keys {
+            let (x, y) = (a[k.var.0], b[k.var.0]);
+            let mut ord = if k.by_data {
+                g.data(x).cmp(&g.data(y)).then(x.cmp(&y))
+            } else {
+                x.cmp(&y)
+            };
+            if k.descending {
+                ord = ord.reverse();
+            }
+            if ord != Ordering::Equal {
+                return ord;
+            }
+        }
+        Ordering::Equal
+    }
+}
+
+impl Operator for Sort {
+    fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
+        if let Some(mut input) = self.input.take() {
+            drain(input.as_mut(), g, &mut self.rows)?;
+            let width = self.rows.width;
+            let mut order: Vec<usize> = (0..self.rows.len()).collect();
+            order
+                .sort_by(|&i, &j| Self::compare(g, &self.keys, self.rows.row(i), self.rows.row(j)));
+            let mut sorted = Vec::with_capacity(self.rows.data.len());
+            for i in order {
+                sorted.extend_from_slice(&self.rows.data[i * width..(i + 1) * width]);
+            }
+            self.rows.data = sorted;
+        }
+        while self.pos < self.rows.len() && !out.is_full() {
+            out.push(self.rows.row(self.pos));
+            self.pos += 1;
+        }
+        Ok(())
+    }
+}
+
 /// The first rows.
 struct Limit {
     input: Box<dyn Operator>,
@@ -368,6 +592,129 @@ impl Operator for Limit {
         self.remaining -= keep;
         Ok(())
     }
+}
+
+/// What building operators needs to know.
+#[derive(Debug, Clone, Copy)]
+struct Context {
+    /// The slots of a row.
+    width: usize,
+    /// The query's `as_of`.
+    as_of: Option<u64>,
+}
+
+impl Context {
+    /// The operator evaluating `plan` for the rows of `input`, which bind
+    /// `bound`; on return, `bound` is what its rows bind.
+    fn build(
+        &self,
+        plan: &GroupPlan,
+        input: Box<dyn Operator>,
+        bound: &mut [bool],
+    ) -> Box<dyn Operator> {
+        let width = self.width;
+        let mut op = input;
+        for step in &plan.steps {
+            op = match step {
+                Step::Pattern {
+                    pattern,
+                    join,
+                    access,
+                    keys,
+                    ..
+                } => {
+                    let scan = |input, bound: &[bool]| BindJoin {
+                        input,
+                        matcher: Matcher {
+                            pattern: *pattern,
+                            access: *access,
+                            bound: bound.to_vec(),
+                            as_of: pattern.as_of.or(self.as_of),
+                        },
+                        in_batch: Batch::new(width),
+                        in_pos: 0,
+                        pending: Batch::new(width),
+                        pending_pos: 0,
+                    };
+                    let joined: Box<dyn Operator> = match join {
+                        Join::Bind => Box::new(scan(op, bound)),
+                        Join::Hash => Box::new(HashJoin {
+                            probe: op,
+                            build: Some(Box::new(scan(unit(width), &vec![false; width]))),
+                            keys: keys.clone(),
+                            new_vars: new_vars(pattern.vars(), bound),
+                            table: HashMap::new(),
+                            in_batch: Batch::new(width),
+                            in_pos: 0,
+                            current: None,
+                        }),
+                    };
+                    pattern.vars().for_each(|v| bound[v.0] = true);
+                    joined
+                }
+                Step::Union {
+                    branches,
+                    vars,
+                    keys,
+                    join,
+                    ..
+                } => {
+                    let joined: Box<dyn Operator> = match join {
+                        Join::Bind => Box::new(UnionBind {
+                            input: op,
+                            branches: branches.clone(),
+                            bound: bound.to_vec(),
+                            ctx: *self,
+                            pending: Batch::new(width),
+                            pending_pos: 0,
+                        }),
+                        Join::Hash => {
+                            let ops = branches
+                                .iter()
+                                .map(|b| self.build(b, unit(width), &mut vec![false; width]))
+                                .collect();
+                            Box::new(HashJoin {
+                                probe: op,
+                                build: Some(Box::new(Concat { ops })),
+                                keys: keys.clone(),
+                                new_vars: new_vars(vars.iter().copied(), bound),
+                                table: HashMap::new(),
+                                in_batch: Batch::new(width),
+                                in_pos: 0,
+                                current: None,
+                            })
+                        }
+                    };
+                    vars.iter().for_each(|v| bound[v.0] = true);
+                    joined
+                }
+                Step::Filter(filters) => Box::new(FilterOp {
+                    input: op,
+                    filters: filters.clone(),
+                    batch: Batch::new(width),
+                }),
+                Step::Not {
+                    group, keys, join, ..
+                } => Box::new(AntiJoin {
+                    input: op,
+                    group: group.clone(),
+                    keys: keys.clone(),
+                    bound: bound.to_vec(),
+                    ctx: *self,
+                    once: (*join == Join::Hash).then_some(None),
+                }),
+            };
+        }
+        op
+    }
+}
+
+/// The distinct variables of `vars` that are not `bound`.
+fn new_vars(vars: impl Iterator<Item = Var>, bound: &[bool]) -> Vec<Var> {
+    let mut vars: Vec<Var> = vars.filter(|v| !bound[v.0]).collect();
+    vars.sort();
+    vars.dedup();
+    vars
 }
 
 /// The rows of a query, made by [`Plan::execute`].
@@ -411,70 +758,27 @@ impl Plan {
     pub fn execute<'g>(&self, g: &'g Graph) -> Rows<'g> {
         let q = &self.query;
         // A row has a slot even with no variables, so that it is a row.
-        let width = q.names.len().max(1);
-        let filters = |ids: &[usize]| ids.iter().map(|&f| q.filters[f].clone()).collect();
-        let with_filters = |op: Box<dyn Operator>, ids: &[usize]| -> Box<dyn Operator> {
-            if ids.is_empty() {
-                op
-            } else {
-                Box::new(FilterOp {
-                    input: op,
-                    filters: filters(ids),
-                    batch: Batch::new(width),
-                })
-            }
+        let ctx = Context {
+            width: q.names.len().max(1),
+            as_of: q.as_of,
         };
-        let unit = || Box::new(Unit { done: false }) as Box<dyn Operator>;
-        let mut op = with_filters(unit(), &self.initial_filters);
-        let mut bound = vec![false; width];
-        for step in &self.steps {
-            let pattern = q.patterns[step.pattern];
-            op = match step.join {
-                Join::Bind => Box::new(BindJoin {
-                    input: op,
-                    matcher: Matcher {
-                        pattern,
-                        access: step.access,
-                        bound: bound.clone(),
-                        as_of: q.as_of,
-                    },
-                    in_batch: Batch::new(width),
-                    in_pos: 0,
-                    pending: Batch::new(width),
-                    pending_pos: 0,
-                }),
-                Join::Hash => {
-                    let scan = BindJoin {
-                        input: unit(),
-                        matcher: Matcher {
-                            pattern,
-                            access: step.access,
-                            bound: vec![false; width],
-                            as_of: q.as_of,
-                        },
-                        in_batch: Batch::new(width),
-                        in_pos: 0,
-                        pending: Batch::new(width),
-                        pending_pos: 0,
-                    };
-                    let keys = shared_vars(&pattern, &bound);
-                    let mut new_vars: Vec<Var> = pattern.vars().filter(|v| !bound[v.0]).collect();
-                    new_vars.sort();
-                    new_vars.dedup();
-                    Box::new(HashJoin {
-                        probe: op,
-                        build: Some(Box::new(scan)),
-                        keys,
-                        new_vars,
-                        table: HashMap::new(),
-                        in_batch: Batch::new(width),
-                        in_pos: 0,
-                        current: None,
-                    })
-                }
-            };
-            op = with_filters(op, &step.filters);
-            pattern.vars().for_each(|v| bound[v.0] = true);
+        let mut op = ctx.build(&self.root, unit(ctx.width), &mut vec![false; ctx.width]);
+        let select = q.selected();
+        if q.distinct {
+            op = Box::new(Distinct {
+                input: op,
+                keys: select.clone(),
+                seen: HashSet::new(),
+                batch: Batch::new(ctx.width),
+            });
+        }
+        if !q.order.is_empty() {
+            op = Box::new(Sort {
+                input: Some(op),
+                keys: q.order.clone(),
+                rows: Batch::new(ctx.width),
+                pos: 0,
+            });
         }
         if let Some(n) = q.limit {
             op = Box::new(Limit {
@@ -485,8 +789,8 @@ impl Plan {
         Rows {
             g,
             op,
-            select: q.selected(),
-            batch: Batch::new(width),
+            select,
+            batch: Batch::new(ctx.width),
             pos: 0,
             done: false,
         }
