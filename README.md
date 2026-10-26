@@ -62,6 +62,11 @@ with them says whether it is live or dead. Ids increase as entries are
 appended, so queries taking `as_of` see the graph as of that id. Appends are
 visible at once and durable on `commit`; `batch` appends all or nothing.
 
+Links may be about other links. `set_link` makes a property single-valued by
+deleting its other live values. `node_by_key` finds or creates the node with a
+unique key. `import` loads entries numbered elsewhere, mapping their ids to
+local ones.
+
 ## Record log usage
 
 ```rust

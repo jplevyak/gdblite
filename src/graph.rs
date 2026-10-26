@@ -2,9 +2,12 @@
 //! database and indexed by [`tuple_index`].
 //!
 //! Replaces the C++ `TupleStore`, keeping its graph database core and leaving
-//! out its schema-driven write pipeline (primary keys, compounds,
-//! `replaced_by`, cardinality, subgraph unions), base/extension layering, and
-//! import/export formats.
+//! out its schema-driven write pipeline (compounds, `replaced_by`, per-predicate
+//! cardinality, subgraph unions), base/extension layering, and import/export
+//! formats.  From that pipeline it keeps, in simpler form, single-valued
+//! properties ([`set_link`](Graph::set_link)), unique keys
+//! ([`node_by_key`](Graph::node_by_key)), and importing entries numbered
+//! elsewhere ([`import`](Graph::import)).
 //!
 //! # Entries
 //!
@@ -12,7 +15,9 @@
 //! values are interned, so each distinct data is one value.  A *link* is a
 //! tuple of subject, predicate, object, author, creation time (`when`) and
 //! any number of subgraphs (see [`LinkFields`]), each field the id of an
-//! earlier entry (or 0) except `when`.
+//! earlier entry (or 0) except `when`.  The subject, predicate and object
+//! must be non-zero; any of them may be a link, to make statements about
+//! links.
 //!
 //! # Link state
 //!
@@ -26,6 +31,12 @@
 //! [`live`](Graph::live) keeps those that are the latest, live link of their
 //! SPO.  It needs every link of each SPO in the set, which every set found by
 //! subject, predicate or object (or a pair of them) has.
+//!
+//! # Keys
+//!
+//! An entity may have a unique key: a value linked from it by the predicate
+//! whose data is [`KEY_PREDICATE`].  Each key names at most one entity, and
+//! each entity has at most one key.
 //!
 //! # Time
 //!
@@ -53,6 +64,9 @@ use crate::record::{Link, LinkFields, LinkState, Linkage, Record, now};
 use crate::record_log::Entry;
 use crate::tuple_index::{self, Intersection, NUM_BUILTIN_INDEXES};
 
+/// The data of the value that is the predicate of key links.
+pub const KEY_PREDICATE: &[u8] = b"gdblite:key";
+
 /// Errors from a graph.
 #[derive(Debug)]
 pub enum Error {
@@ -61,6 +75,11 @@ pub enum Error {
     /// Encoding or reading an entry failed, or a link refers forward.
     Record(crate::Error),
     InvalidArgument(&'static str),
+    /// The key is already the key of the entity with this id.
+    KeyInUse(u64),
+    /// An imported link refers to this id, which is neither in the graph nor
+    /// an earlier imported entry that was written.
+    Unresolved(u64),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -72,6 +91,8 @@ impl fmt::Display for Error {
             Error::Index(e) => write!(f, "{e}"),
             Error::Record(e) => write!(f, "record: {e}"),
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
+            Error::KeyInUse(id) => write!(f, "key is in use by {id}"),
+            Error::Unresolved(id) => write!(f, "unresolved reference to {id}"),
         }
     }
 }
@@ -82,7 +103,7 @@ impl std::error::Error for Error {
             Error::Local(e) => Some(e),
             Error::Index(e) => Some(e),
             Error::Record(e) => Some(e),
-            Error::InvalidArgument(_) => None,
+            Error::InvalidArgument(_) | Error::KeyInUse(_) | Error::Unresolved(_) => None,
         }
     }
 }
@@ -109,6 +130,25 @@ impl From<crate::Error> for Error {
     fn from(e: crate::Error) -> Self {
         Error::Record(e)
     }
+}
+
+/// What [`Graph::import`] does with a link it cannot import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OnError {
+    /// Fail the import, leaving what it already appended.
+    #[default]
+    Stop,
+    /// Skip the link, and the links that refer to it.
+    Skip,
+}
+
+/// The result of [`Graph::import`].
+#[derive(Debug, Default)]
+pub struct Imported {
+    /// The local id of each imported entry that was written or matched.
+    pub ids: BTreeMap<u64, u64>,
+    /// The ids of the links skipped, with why.
+    pub skipped: Vec<(u64, Error)>,
 }
 
 /// A graph database; see the [module](self) docs.
@@ -267,10 +307,36 @@ impl Graph {
         })
     }
 
+    /// Checks that `fields` make a link here.
+    fn check_link(&self, fields: &LinkFields) -> Result<()> {
+        if fields.subject == 0 || fields.predicate == 0 || fields.object == 0 {
+            return Err(Error::InvalidArgument(
+                "a link needs a subject, predicate and object",
+            ));
+        }
+        let ids = [
+            fields.subject,
+            fields.predicate,
+            fields.object,
+            fields.author,
+        ];
+        for &id in ids.iter().chain(&fields.subgraphs) {
+            if id != 0 && id < self.start_id() {
+                return Err(Error::InvalidArgument("a link field is before the graph"));
+            }
+            if id >= self.next_id() {
+                return Err(crate::Error::ForwardReference.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Appends a link with `fields`, unless the latest link with its SPO
-    /// already has its state, which is returned instead.  Every field but
-    /// `when` must be 0 or the id of an earlier entry.
+    /// already has its state, which is returned instead.  The subject,
+    /// predicate and object must be the ids of earlier entries, and the
+    /// other fields but `when` 0 or such ids.
     pub fn add_link(&mut self, fields: &LinkFields) -> Result<u64> {
+        self.check_link(fields)?;
         if let Some((id, state)) = self.latest_link(fields.subject, fields.predicate, fields.object)
             && state == fields.state
         {
@@ -301,6 +367,203 @@ impl Graph {
                 .map(Some),
             _ => Ok(None),
         }
+    }
+
+    /// Links `subject` to `object` by `predicate`, now, deleting any other
+    /// live links from `subject` by `predicate`, so that `object` is the
+    /// property's only value.  Returns the live link.
+    pub fn set_link(&mut self, subject: u64, predicate: u64, object: u64) -> Result<u64> {
+        self.check_link(&LinkFields {
+            subject,
+            predicate,
+            object,
+            ..LinkFields::default()
+        })?;
+        for other in self.follow_forward(predicate, [subject]) {
+            if other != object {
+                self.delete_link(subject, predicate, other)?;
+            }
+        }
+        self.link(subject, predicate, object)
+    }
+
+    /// The object of the latest live link from `subject` by `predicate`.
+    pub fn property(&self, subject: u64, predicate: u64) -> Option<u64> {
+        let (links, _) = self
+            .query_property([subject], Linkage::Subject, predicate, None)
+            .expect("subject");
+        self.with_link(*links.last()?, |l| l.object())
+    }
+
+    /// The entity whose key is `key`.
+    pub fn find_by_key(&self, key: &[u8]) -> Option<u64> {
+        let predicate = self.find_value(KEY_PREDICATE)?;
+        let (links, _) = self
+            .query_property([self.find_value(key)?], Linkage::Object, predicate, None)
+            .expect("object");
+        self.with_link(*links.last()?, |l| l.subject())
+    }
+
+    /// The key of `id`.
+    pub fn key(&self, id: u64) -> Option<&[u8]> {
+        self.data(self.property(id, self.find_value(KEY_PREDICATE)?)?)
+    }
+
+    /// The node whose key is `key`, appending one if there is none.
+    pub fn node_by_key(&mut self, key: &[u8]) -> Result<u64> {
+        if key.is_empty() {
+            return Err(Error::InvalidArgument("empty key"));
+        }
+        if let Some(id) = self.find_by_key(key) {
+            return Ok(id);
+        }
+        let node = self.node()?;
+        self.set_key(node, key)?;
+        Ok(node)
+    }
+
+    /// Makes `key` the key of `id`, replacing any key it has.  Fails if `key`
+    /// is another entity's.
+    pub fn set_key(&mut self, id: u64, key: &[u8]) -> Result<()> {
+        if key.is_empty() {
+            return Err(Error::InvalidArgument("empty key"));
+        }
+        match self.find_by_key(key) {
+            Some(owner) if owner == id => return Ok(()),
+            Some(owner) => return Err(Error::KeyInUse(owner)),
+            None => {}
+        }
+        if !self.contains(id) {
+            return Err(Error::InvalidArgument("not an entity in the graph"));
+        }
+        let predicate = self.value(KEY_PREDICATE)?;
+        let key = self.value(key)?;
+        self.set_link(id, predicate, key)?;
+        Ok(())
+    }
+
+    /// Removes the key of `id`, returning whether it had one.
+    pub fn remove_key(&mut self, id: u64) -> Result<bool> {
+        let Some(predicate) = self.find_value(KEY_PREDICATE) else {
+            return Ok(false);
+        };
+        let Some(key) = self.property(id, predicate) else {
+            return Ok(false);
+        };
+        Ok(self.delete_link(id, predicate, key)?.is_some())
+    }
+
+    /// Imports `records`, numbered elsewhere, in increasing id order.
+    ///
+    /// A reference below the first record's id is to an entry already in
+    /// this graph; one at or above it is to an earlier record.  Values are
+    /// interned, links deduplicated as by [`add_link`](Self::add_link), and
+    /// nodes and values written only when a link first refers to them, so
+    /// that ones nothing refers to are not written.
+    ///
+    /// The import does not commit; run it in a [`batch`](Self::batch) to
+    /// import all or nothing.
+    pub fn import<'a>(
+        &mut self,
+        records: impl IntoIterator<Item = Record<'a>>,
+        on_error: OnError,
+    ) -> Result<Imported> {
+        let local_end = self.next_id();
+        let mut start = None;
+        let mut last = None;
+        // Nodes and values not yet referred to, by id: the data of each value.
+        let mut pending: HashMap<u64, Option<Vec<u8>>> = HashMap::new();
+        let mut imported = Imported::default();
+        for record in records {
+            let id = record.id();
+            if last.is_some_and(|last| id <= last) {
+                return Err(Error::InvalidArgument(
+                    "records are not in increasing id order",
+                ));
+            }
+            last = Some(id);
+            let start = *start.get_or_insert(id);
+            let Some(link) = record.as_link() else {
+                pending.insert(
+                    id,
+                    record.data().filter(|d| !d.is_empty()).map(<[u8]>::to_vec),
+                );
+                continue;
+            };
+            let result = self.import_link(
+                link.fields(),
+                start,
+                local_end,
+                &mut pending,
+                &mut imported.ids,
+            );
+            match result {
+                Ok(local) => {
+                    imported.ids.insert(id, local);
+                }
+                Err(e) if on_error == OnError::Skip => imported.skipped.push((id, e)),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(imported)
+    }
+
+    /// Imports a link with `fields` in the import's numbering, writing the
+    /// nodes and values it is the first to refer to.
+    fn import_link(
+        &mut self,
+        mut fields: LinkFields,
+        start: u64,
+        local_end: u64,
+        pending: &mut HashMap<u64, Option<Vec<u8>>>,
+        ids: &mut BTreeMap<u64, u64>,
+    ) -> Result<u64> {
+        let resolvable = |id: u64| {
+            id == 0
+                || (id < start && (self.start_id()..local_end).contains(&id))
+                || ids.contains_key(&id)
+                || pending.contains_key(&id)
+        };
+        let refs = [
+            fields.subject,
+            fields.predicate,
+            fields.object,
+            fields.author,
+        ];
+        if let Some(&id) = refs
+            .iter()
+            .chain(&fields.subgraphs)
+            .find(|&&id| !resolvable(id))
+        {
+            return Err(Error::Unresolved(id));
+        }
+        if fields.subject == 0 || fields.predicate == 0 || fields.object == 0 {
+            return Err(Error::InvalidArgument(
+                "a link needs a subject, predicate and object",
+            ));
+        }
+        let mut resolve = |g: &mut Graph, id: u64| -> Result<u64> {
+            if id == 0 || id < start {
+                return Ok(id);
+            }
+            if let Some(&local) = ids.get(&id) {
+                return Ok(local);
+            }
+            let local = match pending.remove(&id).expect("resolvable") {
+                Some(data) => g.value(&data)?,
+                None => g.node()?,
+            };
+            ids.insert(id, local);
+            Ok(local)
+        };
+        fields.subject = resolve(self, fields.subject)?;
+        fields.predicate = resolve(self, fields.predicate)?;
+        fields.object = resolve(self, fields.object)?;
+        fields.author = resolve(self, fields.author)?;
+        for subgraph in &mut fields.subgraphs {
+            *subgraph = resolve(self, *subgraph)?;
+        }
+        self.add_link(&fields)
     }
 
     /// Every link, live or dead, with this SPO.

@@ -316,3 +316,199 @@ fn snapshot_restore() {
         g.records(g.start_id()).count()
     );
 }
+
+#[test]
+fn link_checks() {
+    let mut g = graph();
+    let (a, p) = (g.node().unwrap(), g.value(b"p").unwrap());
+    for (s, p, o) in [(0, p, a), (a, 0, a), (a, p, 0)] {
+        assert!(matches!(g.link(s, p, o), Err(Error::InvalidArgument(_))));
+    }
+    assert!(matches!(
+        g.set_link(a, p, 0),
+        Err(Error::InvalidArgument(_))
+    ));
+    // Links may be about links.
+    let l = g.link(a, p, a).unwrap();
+    let said = g.value(b"said").unwrap();
+    let meta = g.link(l, said, a).unwrap();
+    assert_eq!(g.follow_forward(said, [l]), set(&[a]));
+    assert_eq!(g.follow_backward(said, [a]), set(&[l]));
+    assert!(g.get(meta).unwrap().is_link());
+}
+
+#[test]
+fn set_link() {
+    let mut g = graph();
+    let a = g.node().unwrap();
+    let age = g.value(b"age").unwrap();
+    let (v1, v2, v3) = (
+        g.value(b"1").unwrap(),
+        g.value(b"2").unwrap(),
+        g.value(b"3").unwrap(),
+    );
+    assert_eq!(g.property(a, age), None);
+    g.link(a, age, v1).unwrap();
+    g.link(a, age, v2).unwrap();
+    assert_eq!(g.follow_forward(age, [a]), set(&[v1, v2]));
+
+    let l3 = g.set_link(a, age, v3).unwrap();
+    assert_eq!(g.follow_forward(age, [a]), set(&[v3]));
+    assert_eq!(g.property(a, age), Some(v3));
+    // Setting the same value again changes nothing.
+    let next = g.next_id();
+    assert_eq!(g.set_link(a, age, v3).unwrap(), l3);
+    assert_eq!(g.next_id(), next);
+    // The old values are still in history.
+    assert_eq!(g.find_link(a, age, v1), None);
+    assert_eq!(g.find_links(a, age, v1).len(), 2);
+}
+
+#[test]
+fn keys() {
+    let mut g = graph();
+    assert_eq!(g.find_by_key(b"alice"), None);
+    let alice = g.node_by_key(b"alice").unwrap();
+    assert_eq!(g.node_by_key(b"alice").unwrap(), alice);
+    assert_eq!(g.find_by_key(b"alice"), Some(alice));
+    assert_eq!(g.key(alice), Some(&b"alice"[..]));
+    assert!(matches!(g.node_by_key(b""), Err(Error::InvalidArgument(_))));
+
+    let bob = g.node_by_key(b"bob").unwrap();
+    assert_ne!(bob, alice);
+    assert!(matches!(g.set_key(bob, b"alice"), Err(Error::KeyInUse(id)) if id == alice));
+    g.set_key(alice, b"alice").unwrap();
+
+    // Renaming frees the old key.
+    g.set_key(alice, b"alicia").unwrap();
+    assert_eq!(g.key(alice), Some(&b"alicia"[..]));
+    assert_eq!(g.find_by_key(b"alice"), None);
+    assert_eq!(g.find_by_key(b"alicia"), Some(alice));
+    g.set_key(bob, b"alice").unwrap();
+    assert_eq!(g.find_by_key(b"alice"), Some(bob));
+
+    // Any entity may have a key.
+    let v = g.value(b"some value").unwrap();
+    g.set_key(v, b"v").unwrap();
+    assert_eq!(g.find_by_key(b"v"), Some(v));
+
+    assert!(g.remove_key(bob).unwrap());
+    assert!(!g.remove_key(bob).unwrap());
+    assert_eq!(g.key(bob), None);
+    assert_eq!(g.find_by_key(b"alice"), None);
+    assert!(matches!(
+        g.set_key(g.next_id(), b"x"),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+/// Links in an import's numbering.
+fn foreign_link(id: u64, s: u64, p: u64, o: u64) -> Record<'static> {
+    Record::link(
+        id,
+        &LinkFields {
+            subject: s,
+            predicate: p,
+            object: o,
+            when: 1_700_000_000_000,
+            ..LinkFields::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn import() {
+    let mut g = graph();
+    let knows = g.value(b"knows").unwrap();
+    let local_alice = g.node().unwrap();
+
+    // Foreign ids start well above the graph's.
+    let base = 1000;
+    let records = vec![
+        Record::node(base),                // bob
+        Record::value(base + 1, b"knows"), // already here
+        Record::value(base + 2, b"likes"), // new
+        Record::node(base + 3),            // unreferenced
+        Record::value(base + 4, b"likes"), // a duplicate
+        Record::value(base + 5, b"unreferenced"),
+        foreign_link(base + 10, local_alice, base + 1, base),
+        foreign_link(base + 20, base, base + 4, local_alice),
+        foreign_link(base + 30, local_alice, base + 1, base), // a duplicate
+        foreign_link(base + 40, base + 10, base + 2, base),   // about a link
+    ];
+    let imported = g.import(records, OnError::Stop).unwrap();
+    assert!(imported.skipped.is_empty());
+    let ids = &imported.ids;
+    let bob = ids[&base];
+    let likes = ids[&(base + 2)];
+    assert_eq!(ids[&(base + 1)], knows);
+    assert_eq!(ids[&(base + 4)], likes);
+    assert!(!ids.contains_key(&(base + 3)));
+    assert!(!ids.contains_key(&(base + 5)));
+    assert_eq!(g.find_value(b"unreferenced"), None);
+    assert_eq!(g.follow_forward(knows, [local_alice]), set(&[bob]));
+    assert_eq!(g.follow_forward(likes, [bob]), set(&[local_alice]));
+    assert_eq!(ids[&(base + 30)], ids[&(base + 10)]);
+    assert_eq!(g.follow_forward(likes, [ids[&(base + 10)]]), set(&[bob]));
+    assert_eq!(
+        g.get(ids[&(base + 10)]).unwrap().as_link().unwrap().when(),
+        1_700_000_000_000
+    );
+
+    // Re-importing changes nothing.
+    let next = g.next_id();
+    let again = vec![
+        Record::node(base),
+        Record::value(base + 1, b"knows"),
+        foreign_link(base + 10, local_alice, base + 1, base),
+    ];
+    let imported = g.import(again, OnError::Stop).unwrap();
+    // The node is new to this import, though: it is a different entity.
+    assert_ne!(imported.ids[&base], bob);
+    assert!(g.next_id() > next);
+}
+
+#[test]
+fn import_errors() {
+    let mut g = graph();
+    let p = g.value(b"p").unwrap();
+    let base = 1000;
+    let bad = || {
+        vec![
+            Record::node(base),
+            foreign_link(base + 10, base, p, base + 5), // not a record
+            foreign_link(base + 20, base + 10, p, base), // refers to a skipped link
+            foreign_link(base + 30, base, p, 900),      // a local id not in the graph
+            foreign_link(base + 40, base, p, base),
+        ]
+    };
+
+    let err = g.import(bad(), OnError::Stop);
+    assert!(matches!(err, Err(Error::Unresolved(id)) if id == base + 5));
+
+    let imported = g.import(bad(), OnError::Skip).unwrap();
+    let skipped: Vec<_> = imported.skipped.iter().map(|(id, _)| *id).collect();
+    assert_eq!(skipped, [base + 10, base + 20, base + 30]);
+    assert!(matches!(imported.skipped[1].1, Error::Unresolved(id) if id == base + 10));
+    let n = imported.ids[&base];
+    assert_eq!(g.follow_forward(p, [n]), set(&[n]));
+
+    let out_of_order = vec![Record::node(base + 1), Record::node(base)];
+    assert!(matches!(
+        g.import(out_of_order, OnError::Skip),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // In a batch, a failed import leaves nothing.
+    g.commit().unwrap();
+    let links = g.links_at(Linkage::Predicate, [p]);
+    let records = vec![
+        Record::node(base),
+        foreign_link(base + 10, base, p, base),
+        foreign_link(base + 20, base, p, base + 5),
+    ];
+    let err = g.batch(|g| g.import(records, OnError::Stop));
+    assert!(matches!(err, Err(Error::Unresolved(id)) if id == base + 5));
+    assert_eq!(g.links_at(Linkage::Predicate, [p]), links);
+}
