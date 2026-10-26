@@ -1,10 +1,13 @@
 //! Cost-based planning of a [`Query`]; see the [module](super) docs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
+use super::reduce::{self, Link, Reduced, Reduction};
 use super::{Filter, Group, Pattern, Query, Term, Var};
 use crate::graph::{Error, Graph, Result};
+use crate::local_table::IdSet;
 use crate::record::Linkage;
 use crate::tuple_index;
 
@@ -24,6 +27,10 @@ const PROBE_COST: f64 = 1.0;
 const FILTER_COST: f64 = 0.2;
 /// The cost of starting to evaluate a group.
 const GROUP_COST: f64 = 1.0;
+/// The cost of a lookup in reduced links, apart from the links it finds.
+const REDUCED_LOOKUP_COST: f64 = 0.5;
+/// The cost of a reduced link found by a lookup or a scan.
+const REDUCED_ENTRY_COST: f64 = 0.2;
 
 /// The index a pattern is looked up in, given what is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,13 +102,19 @@ pub(crate) enum Join {
 #[derive(Debug, Clone)]
 pub(crate) enum Step {
     /// Joins a pattern: for a bind join, `access` is the lookup for each
-    /// row; for a hash join, the scan, joined on `keys`.
+    /// row; for a hash join, the scan, joined on `keys`.  If the pattern was
+    /// reduced, its links are `reduced` and `access` is unused; if its group
+    /// was, the values it binds must be among the variables' `candidates`.
     Pattern {
         pattern: Pattern,
         join: Join,
         access: Access,
         keys: Vec<Var>,
         rows: f64,
+        reduced: Option<Arc<Vec<Link>>>,
+        /// Whether `reduced` must be used: the links are given, not found.
+        required: bool,
+        candidates: Option<Arc<Vec<Option<IdSet>>>>,
     },
     /// Joins a union, whose branches bind `vars`.  The branches' plans are
     /// for the rows so far, for a bind join, or alone, for a hash join on
@@ -123,6 +136,37 @@ pub(crate) enum Step {
         join: Join,
         rows: f64,
     },
+    /// Keeps the rows for which a negated group's match changes between the
+    /// graph as `old` sees it and as `new` does: to no match if
+    /// `to_unmatched`, else to a match.  Only rows whose values of
+    /// `flip_vars` are in `flips` can change.
+    NotChange {
+        old: GroupPlan,
+        new: GroupPlan,
+        keys: Vec<Var>,
+        flips: Arc<HashSet<Vec<u64>>>,
+        flip_vars: Vec<Var>,
+        to_unmatched: bool,
+        rows: f64,
+    },
+}
+
+/// Replacements in a query, for computing its changes: patterns whose
+/// links are given, and negations whose changes are wanted, by the address
+/// of their group and their index in it.
+#[derive(Default)]
+pub(crate) struct Overrides {
+    pub patterns: HashMap<(usize, usize), Vec<Link>>,
+    pub nots: HashMap<(usize, usize), NotChange>,
+}
+
+/// A negated group as the graph was and is; see [`Step::NotChange`].
+pub(crate) struct NotChange {
+    pub old: Group,
+    pub new: Group,
+    pub flips: Arc<HashSet<Vec<u64>>>,
+    pub flip_vars: Vec<Var>,
+    pub to_unmatched: bool,
 }
 
 /// The plan of a group.
@@ -139,6 +183,10 @@ pub(crate) struct GroupPlan {
 pub struct Plan {
     pub(crate) query: Query,
     pub(crate) root: GroupPlan,
+    /// The reduction of the query's top group, if any.
+    pub(crate) reduction: Option<Arc<Reduction>>,
+    /// The graph's next id when planned: the reduction is of the graph then.
+    pub(crate) next_id: u64,
 }
 
 impl Plan {
@@ -157,6 +205,25 @@ impl Plan {
     pub fn explain(&self) -> String {
         let q = &self.query;
         let mut out = String::new();
+        if let Some(r) = &self.reduction {
+            let vars: Vec<String> = r
+                .vars
+                .iter()
+                .enumerate()
+                .filter_map(|(v, s)| Some(format!("{} {}", q.var_name(Var(v)), s.as_ref()?.len())))
+                .collect();
+            let _ = writeln!(
+                out,
+                "reduce: {} candidates, {} index entries read{}",
+                vars.join(", "),
+                r.entries,
+                if r.complete {
+                    ""
+                } else {
+                    ", stopped at budget"
+                }
+            );
+        }
         explain_group(q, &self.root, 0, true, &mut out);
         if q.distinct {
             out.push_str("distinct\n");
@@ -197,13 +264,18 @@ fn explain_group(q: &Query, plan: &GroupPlan, depth: usize, alone: bool, out: &m
                 access,
                 keys,
                 rows,
+                reduced,
+                ..
             } => {
+                let access = match reduced {
+                    Some(links) => format!("{} reduced links", links.len()),
+                    None => access.name().to_string(),
+                };
                 let _ = writeln!(
                     out,
-                    "{pad}{} {} via {}, rows ~{rows:.0}",
+                    "{pad}{} {} via {access}, rows ~{rows:.0}",
                     join_name(q, first, *join, keys),
                     q.pattern_name(pattern),
-                    access.name(),
                 );
                 first = false;
             }
@@ -247,6 +319,24 @@ fn explain_group(q: &Query, plan: &GroupPlan, depth: usize, alone: bool, out: &m
                     keys.join(", ")
                 );
                 explain_group(q, group, depth + 1, *join == Join::Hash, out);
+            }
+            Step::NotChange {
+                old,
+                new,
+                to_unmatched,
+                flips,
+                rows,
+                ..
+            } => {
+                let to = if *to_unmatched { "no match" } else { "a match" };
+                let _ = writeln!(
+                    out,
+                    "{pad}not changing to {to}, of {} keys, rows ~{rows:.0}; was:",
+                    flips.len()
+                );
+                explain_group(q, old, depth + 1, false, out);
+                let _ = writeln!(out, "{pad}is:");
+                explain_group(q, new, depth + 1, false, out);
             }
         }
     }
@@ -389,7 +479,9 @@ fn ratio(a: u64, b: u64) -> f64 {
 /// A pattern or union of a group, to be joined.
 #[derive(Clone, Copy)]
 enum Item<'q> {
-    Pattern(&'q Pattern),
+    /// A pattern, its reduced links, if it has them, and whether they are
+    /// required.
+    Pattern(&'q Pattern, Option<&'q Reduced>, bool),
     Union(&'q [Group]),
 }
 
@@ -407,16 +499,21 @@ struct Partial {
     nots_done: Vec<bool>,
 }
 
-struct Planner<'g> {
+struct Planner<'g, 'o> {
     est: Estimator<'g>,
+    overrides: &'o Overrides,
     width: usize,
     /// For testing: the join to use wherever it can be.
     force: Option<Join>,
+    /// The top group (by address), and its reduction.
+    root: usize,
+    reduction: Option<Arc<Reduction>>,
+    candidates: Option<Arc<Vec<Option<IdSet>>>>,
     /// The plans of groups (by address) for the variables bound.
     memo: HashMap<(usize, Vec<bool>), Option<GroupPlan>>,
 }
 
-impl Planner<'_> {
+impl Planner<'_, '_> {
     fn unbound(&self) -> Vec<bool> {
         vec![false; self.width]
     }
@@ -434,12 +531,23 @@ impl Planner<'_> {
     }
 
     fn plan_group_uncached(&mut self, group: &Group, bound: &[bool]) -> Option<GroupPlan> {
+        let address = group as *const Group as usize;
+        let reduction = self.reduction.clone().filter(|_| address == self.root);
+        // Each pattern's reduced links: given, or found by the reduction.
+        let reduced: Vec<(Option<Reduced>, bool)> = (0..group.patterns.len())
+            .map(|i| match self.overrides.patterns.get(&(address, i)) {
+                Some(links) => (Some(Reduced::new(&group.patterns[i], links.clone())), true),
+                None => (reduction.as_ref().and_then(|r| r.links[i].clone()), false),
+            })
+            .collect();
         let items: Vec<Item> = group
             .patterns
             .iter()
-            .map(Item::Pattern)
+            .zip(&reduced)
+            .map(|(p, (r, required))| Item::Pattern(p, r.as_ref(), *required))
             .chain(group.unions.iter().map(|u| Item::Union(u)))
             .collect();
+        let candidates = reduction.as_ref().and(self.candidates.clone());
         // The variables bound once every item is joined.
         let mut bindable = bound.to_vec();
         group.bound_vars().iter().for_each(|v| bindable[v.0] = true);
@@ -462,7 +570,7 @@ impl Planner<'_> {
                     continue;
                 };
                 for i in (0..n).filter(|&i| mask & (1 << i) == 0) {
-                    for way in self.extend(group, &bindable, &partial, items[i]) {
+                    for way in self.extend(group, &bindable, &partial, items[i], &candidates) {
                         let next = &mut best[mask | (1 << i)];
                         if next.as_ref().is_none_or(|b| way.cost < b.cost) {
                             *next = Some(way);
@@ -478,7 +586,7 @@ impl Planner<'_> {
             while !left.is_empty() {
                 let mut ways = Vec::new();
                 for (i, &item) in left.iter().enumerate() {
-                    for way in self.extend(group, &bindable, &partial, item) {
+                    for way in self.extend(group, &bindable, &partial, item, &candidates) {
                         ways.push((i, way));
                     }
                 }
@@ -516,6 +624,7 @@ impl Planner<'_> {
                 ready.iter().map(|&f| group.filters[f].clone()).collect(),
             ));
         }
+        let address = group as *const Group as usize;
         for (i, not) in group.nots.iter().enumerate() {
             // The negation applies once the variables it shares are bound.
             let keys: Vec<Var> = not
@@ -524,6 +633,23 @@ impl Planner<'_> {
                 .filter(|v| bindable[v.0])
                 .collect();
             if p.nots_done[i] || !keys.iter().all(|v| p.bound[v.0]) {
+                continue;
+            }
+            if let Some(change) = self.overrides.nots.get(&(address, i)) {
+                let old = self.plan_group(&change.old, &p.bound)?;
+                let new = self.plan_group(&change.new, &p.bound)?;
+                p.nots_done[i] = true;
+                p.cost += p.rows * (old.cost + new.cost) + 2.0 * GROUP_COST;
+                p.rows = p.rows.min(change.flips.len() as f64);
+                p.steps.push(Step::NotChange {
+                    old,
+                    new,
+                    keys,
+                    flips: change.flips.clone(),
+                    flip_vars: change.flip_vars.clone(),
+                    to_unmatched: change.to_unmatched,
+                    rows: p.rows,
+                });
                 continue;
             }
             let bind = self.plan_group(not, &p.bound).map(|sub| {
@@ -567,13 +693,55 @@ impl Planner<'_> {
         bindable: &[bool],
         partial: &Partial,
         item: Item,
+        candidates: &Option<Arc<Vec<Option<IdSet>>>>,
     ) -> Vec<Partial> {
         let mut after = partial.bound.clone();
         let unbound = self.unbound();
         // The ways: a step, its cost, and the rows after it.
         let mut ways: Vec<(Step, f64, f64)> = Vec::new();
         match item {
-            Item::Pattern(pattern) => {
+            Item::Pattern(pattern, Some(r), required) => {
+                pattern.vars().for_each(|v| after[v.0] = true);
+                let n = r.links.len() as f64;
+                // The links matching each row: the links over the distinct
+                // values of the fields bound.
+                let fields = [
+                    Some(pattern.subject),
+                    Some(pattern.predicate),
+                    Some(pattern.object),
+                    pattern.link.map(Term::Var),
+                ];
+                let mut matches = n;
+                for (k, f) in fields.iter().enumerate() {
+                    if let Some(Term::Var(v)) = f
+                        && partial.bound[v.0]
+                    {
+                        matches /= r.distinct[k].max(1) as f64;
+                    }
+                }
+                let rows = partial.rows * matches;
+                let step = |join| Step::Pattern {
+                    pattern: *pattern,
+                    join,
+                    access: Access::All,
+                    keys: shared_vars(pattern, &partial.bound),
+                    rows,
+                    reduced: Some(r.links.clone()),
+                    required,
+                    candidates: candidates.clone(),
+                };
+                ways.push((
+                    step(Join::Bind),
+                    n * REDUCED_ENTRY_COST
+                        + partial.rows * (REDUCED_LOOKUP_COST + matches * REDUCED_ENTRY_COST),
+                    rows,
+                ));
+                if !partial.unit {
+                    let cost = n * (REDUCED_ENTRY_COST + BUILD_COST) + partial.rows * PROBE_COST;
+                    ways.push((step(Join::Hash), cost, rows));
+                }
+            }
+            Item::Pattern(pattern, None, _) => {
                 pattern.vars().for_each(|v| after[v.0] = true);
                 let bind = self.est.estimate(pattern, &partial.bound);
                 let rows = partial.rows * bind.matches;
@@ -592,6 +760,9 @@ impl Planner<'_> {
                         access: Access::of(link, positions(&partial.bound)),
                         keys: keys.clone(),
                         rows,
+                        reduced: None,
+                        required: false,
+                        candidates: candidates.clone(),
                     },
                     partial.rows * (LOOKUP_COST + bind.entries * ENTRY_COST),
                     rows,
@@ -609,6 +780,9 @@ impl Planner<'_> {
                             access: Access::of(false, positions(&unbound)),
                             keys,
                             rows,
+                            reduced: None,
+                            required: false,
+                            candidates: candidates.clone(),
                         },
                         cost,
                         rows,
@@ -696,12 +870,38 @@ pub(crate) fn plan(q: &Query, g: &Graph) -> Result<Plan> {
 
 /// Plans `q`, using the join `force` wherever it can be.
 pub(crate) fn plan_with(q: &Query, g: &Graph, force: Option<Join>) -> Result<Plan> {
+    plan_full(q, g, force, &Overrides::default())
+}
+
+/// Plans `q` with `overrides`, which are by the addresses of `q`'s groups.
+pub(crate) fn plan_full(
+    q: &Query,
+    g: &Graph,
+    force: Option<Join>,
+    overrides: &Overrides,
+) -> Result<Plan> {
     q.check()?;
     let width = q.names.len();
+    let root = &q.root as *const Group as usize;
+    let budget = q
+        .reduction_budget
+        .unwrap_or(reduce::DEFAULT_REDUCTION_BUDGET);
+    let preset: HashMap<usize, Vec<Link>> = overrides
+        .patterns
+        .iter()
+        .filter(|((group, _), _)| *group == root)
+        .map(|(&(_, i), links)| (i, links.clone()))
+        .collect();
+    let reduction = (budget > 0 && !q.root.patterns.is_empty())
+        .then(|| Arc::new(reduce::reduce(g, &q.root, width, q.as_of, budget, &preset)));
     let mut planner = Planner {
         est: Estimator::new(g),
+        overrides,
         width,
         force,
+        root,
+        candidates: reduction.as_ref().map(|r| Arc::new(r.vars.clone())),
+        reduction: reduction.clone(),
         memo: HashMap::new(),
     };
     let root = planner
@@ -712,5 +912,7 @@ pub(crate) fn plan_with(q: &Query, g: &Graph, force: Option<Join>) -> Result<Pla
     Ok(Plan {
         query: q.clone(),
         root,
+        reduction,
+        next_id: g.next_id(),
     })
 }

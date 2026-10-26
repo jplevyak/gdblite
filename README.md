@@ -75,7 +75,12 @@ with unions, negation (`not`, like SPARQL's `FILTER NOT EXISTS`), filters,
 query or for each pattern. `plan` orders the patterns and unions by
 estimated cost, from index counts and the graph's statistics, choosing a
 bind join (an index lookup per row) or a hash join for each; `execute`
-streams the rows in batches.
+streams the rows in batches. Before joining, the planner reduces the top
+group by constraint propagation, narrowing each variable to candidate ids
+and each pattern to candidate links (within a budget of index entries
+read). `StandingQuery` keeps a query's rows up to date as entries are
+committed, computing the changes from the newly committed links rather
+than evaluating the query again.
 
 ```rust
 use gdblite::graph::{Graph, Options};
@@ -93,6 +98,27 @@ q.pattern(a, knows, x).pattern(x, knows, y).select([y]);
 let plan = q.plan(&g).unwrap();
 println!("{}", plan.explain());
 assert_eq!(plan.execute(&g).collect::<Result<Vec<_>, _>>().unwrap(), [[c]]);
+```
+
+## GraQL
+
+`graql` parses a Turtle-like query language, after the C++ GraQL grammar, and
+runs it with the query engine: `select`, `verify`, `lookup`, and `insert` /
+`delete` with templates. Patterns use `;`, `,` and `.` as in Turtle, blank
+nodes, `/keys`, `and`, `or`, `not`, and comparisons; the parts of the grammar
+the engine does not support yet (optional and transitive predicates, rules,
+aggregates, ...) are reported as such.
+
+```rust
+use gdblite::graph::{Graph, Options};
+use gdblite::graql::{self, Output};
+
+let mut g = Graph::open(None, Options::default()).unwrap();
+graql::execute(&mut g, "insert /alice knows /bob ; age 30 . /bob age 25").unwrap();
+let out = graql::execute(&mut g, "select ?who where /alice knows ?who . ?who age ?a . ?a < 30")
+    .unwrap();
+let Output::Rows { rows, .. } = &out[0] else { panic!() };
+assert_eq!(rows, &[[g.find_by_key(b"/bob").unwrap()]]);
 ```
 
 ## Record log usage
@@ -238,8 +264,11 @@ src/
                       intersections (tests in tuple_index/)
   stats.rs            per-predicate link statistics for query planning
   query/              pattern queries: types (mod.rs), cost-based planner
-                      (plan.rs), batched operators (exec.rs), tests
+                      (plan.rs), reduction by constraint propagation
+                      (reduce.rs), batched operators (exec.rs), standing
+                      queries (standing.rs), tests
   graph.rs            Graph: the graph database API (tests in graph/)
+  graql.rs            GraQL parser and runner (tests in graql/)
 benches/
   record_log.rs       encode/decode benchmarks
 reference/            original C++ sources ported to Rust

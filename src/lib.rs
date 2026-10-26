@@ -12,6 +12,8 @@ mod error;
 #[cfg(all(unix, target_pointer_width = "64"))]
 pub mod graph;
 #[cfg(all(unix, target_pointer_width = "64"))]
+pub mod graql;
+#[cfg(all(unix, target_pointer_width = "64"))]
 pub mod local;
 #[cfg(all(unix, target_pointer_width = "64"))]
 pub mod local_record_log;

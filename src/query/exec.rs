@@ -7,7 +7,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use std::sync::Arc;
+
 use super::plan::{Access, GroupPlan, Join, Plan, Step};
+use super::reduce::{Link, live_links};
 use super::{Filter, Pattern, SortKey, Term, Var};
 use crate::graph::{Graph, Result};
 use crate::local_table::IdSet;
@@ -122,6 +125,12 @@ struct Matcher {
     /// Whether each variable is bound in the rows given.
     bound: Vec<bool>,
     as_of: Option<u64>,
+    /// The pattern's reduced links, used in place of the indexes, and an
+    /// index of them by the values of the fields bound, once built.
+    reduced: Option<Arc<Vec<Link>>>,
+    index: Option<HashMap<Vec<u64>, Vec<Link>>>,
+    /// The candidates of the variables, which the values bound must be in.
+    candidates: Option<Arc<Vec<Option<IdSet>>>>,
 }
 
 impl Matcher {
@@ -181,25 +190,63 @@ impl Matcher {
         }
     }
 
-    /// Appends to `out` a row extending `row` for each live link matching.
-    fn matches(&self, g: &Graph, row: &[u64], out: &mut Batch) -> Result<()> {
-        let candidates = self.candidates(g, row);
-        // The latest link of each subject, predicate and object.
-        let mut latest: HashMap<[u64; 3], (u64, bool)> = HashMap::new();
-        for &id in candidates.range(..=self.as_of.unwrap_or(u64::MAX)) {
-            let Ok(record) = g.get(id) else { continue };
-            if let Some(link) = record.as_link() {
-                let spo = [link.subject(), link.predicate(), link.object()];
-                latest.insert(spo, (id, link.dead()));
-            }
-        }
+    /// The pattern's fields bound in the rows given: subject, predicate,
+    /// object, link.
+    fn bound_fields(&self) -> Vec<usize> {
         let p = &self.pattern;
-        let mut live: Vec<(u64, [u64; 3])> = latest
-            .into_iter()
-            .filter(|&(_, (_, dead))| !dead)
-            .map(|(spo, (id, _))| (id, spo))
+        [
+            Some(p.subject),
+            Some(p.predicate),
+            Some(p.object),
+            p.link.map(Term::Var),
+        ]
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| matches!(f, Some(Term::Var(v)) if self.bound[v.0]))
+        .map(|(k, _)| k)
+        .collect()
+    }
+
+    /// The reduced links matching the fields of `row` bound.
+    fn reduced_links(&mut self, row: &[u64]) -> Vec<Link> {
+        let fields = self.bound_fields();
+        let p = self.pattern;
+        let value = |k: usize, &(id, spo): &Link| if k < 3 { spo[k] } else { id };
+        let key_of_row: Vec<u64> = fields
+            .iter()
+            .map(|&k| {
+                match [
+                    Some(p.subject),
+                    Some(p.predicate),
+                    Some(p.object),
+                    p.link.map(Term::Var),
+                ][k]
+                {
+                    Some(Term::Var(v)) => row[v.0],
+                    _ => unreachable!("a bound variable"),
+                }
+            })
             .collect();
-        live.sort_unstable();
+        let reduced = self.reduced.as_ref().expect("reduced links");
+        let index = self.index.get_or_insert_with(|| {
+            let mut index: HashMap<Vec<u64>, Vec<Link>> = HashMap::new();
+            for link in reduced.iter() {
+                let key = fields.iter().map(|&k| value(k, link)).collect();
+                index.entry(key).or_default().push(*link);
+            }
+            index
+        });
+        index.get(&key_of_row).cloned().unwrap_or_default()
+    }
+
+    /// Appends to `out` a row extending `row` for each live link matching.
+    fn matches(&mut self, g: &Graph, row: &[u64], out: &mut Batch) -> Result<()> {
+        let live = if self.reduced.is_some() {
+            self.reduced_links(row)
+        } else {
+            live_links(g, &self.candidates(g, row), self.as_of)
+        };
+        let p = &self.pattern;
         let mut new = row.to_vec();
         'links: for (id, [s, pr, o]) in live {
             new.copy_from_slice(row);
@@ -225,6 +272,10 @@ impl Matcher {
                         }
                     }
                     Some(Term::Var(v)) => {
+                        let allowed = self.candidates.as_ref().and_then(|c| c[v.0].as_ref());
+                        if allowed.is_some_and(|c| !c.contains(&value)) {
+                            continue 'links;
+                        }
                         new[v.0] = value;
                         set.push(v);
                     }
@@ -410,25 +461,100 @@ struct AntiJoin {
     once: Option<Option<HashSet<Vec<u64>>>>,
 }
 
+/// The values of `keys` of the rows `group` has a match for, evaluated for
+/// `rows`, which bind `bound` (or alone, if `rows` is `None`).
+fn matched(
+    ctx: &Context,
+    g: &Graph,
+    group: &GroupPlan,
+    keys: &[Var],
+    bound: &[bool],
+    rows: Option<&Batch>,
+) -> Result<HashSet<Vec<u64>>> {
+    let (seed, mut bound): (Box<dyn Operator>, Vec<bool>) = match rows {
+        Some(rows) => (
+            Box::new(Seed {
+                rows: Some(rows.clone()),
+            }),
+            bound.to_vec(),
+        ),
+        None => (unit(ctx.width), vec![false; bound.len()]),
+    };
+    let mut op = ctx.build(group, seed, &mut bound);
+    let mut matches = Batch::new(ctx.width);
+    drain(op.as_mut(), g, &mut matches)?;
+    Ok((0..matches.len())
+        .map(|i| keys.iter().map(|v| matches.row(i)[v.0]).collect())
+        .collect())
+}
+
 impl AntiJoin {
-    /// The keys of the rows the group has a match for, evaluated for `rows`
-    /// (or alone, if `rows` is `None`).
     fn matched(&self, g: &Graph, rows: Option<&Batch>) -> Result<HashSet<Vec<u64>>> {
-        let (seed, mut bound): (Box<dyn Operator>, Vec<bool>) = match rows {
-            Some(rows) => (
-                Box::new(Seed {
-                    rows: Some(rows.clone()),
-                }),
-                self.bound.clone(),
-            ),
-            None => (unit(self.ctx.width), vec![false; self.bound.len()]),
-        };
-        let mut op = self.ctx.build(&self.group, seed, &mut bound);
-        let mut matches = Batch::new(self.ctx.width);
-        drain(op.as_mut(), g, &mut matches)?;
-        Ok((0..matches.len())
-            .map(|i| self.keys.iter().map(|v| matches.row(i)[v.0]).collect())
-            .collect())
+        matched(&self.ctx, g, &self.group, &self.keys, &self.bound, rows)
+    }
+}
+
+/// The rows for which a group's match changes between two plans of it; see
+/// [`Step::NotChange`].
+struct NotChange {
+    input: Box<dyn Operator>,
+    old: GroupPlan,
+    new: GroupPlan,
+    keys: Vec<Var>,
+    flips: Arc<HashSet<Vec<u64>>>,
+    flip_vars: Vec<Var>,
+    to_unmatched: bool,
+    bound: Vec<bool>,
+    ctx: Context,
+}
+
+impl Operator for NotChange {
+    fn next(&mut self, g: &Graph, out: &mut Batch) -> Result<()> {
+        loop {
+            let mut input = Batch::new(out.width);
+            self.input.next(g, &mut input)?;
+            if input.is_empty() {
+                return Ok(());
+            }
+            let mut rows = Batch::new(out.width);
+            for i in 0..input.len() {
+                let row = input.row(i);
+                let flip: Vec<u64> = self.flip_vars.iter().map(|v| row[v.0]).collect();
+                if self.flips.contains(&flip) {
+                    rows.push(row);
+                }
+            }
+            if rows.is_empty() {
+                continue;
+            }
+            let old = matched(
+                &self.ctx,
+                g,
+                &self.old,
+                &self.keys,
+                &self.bound,
+                Some(&rows),
+            )?;
+            let new = matched(
+                &self.ctx,
+                g,
+                &self.new,
+                &self.keys,
+                &self.bound,
+                Some(&rows),
+            )?;
+            for i in 0..rows.len() {
+                let row = rows.row(i);
+                let key: Vec<u64> = self.keys.iter().map(|v| row[v.0]).collect();
+                let (was, is) = (old.contains(&key), new.contains(&key));
+                if was != is && was == self.to_unmatched {
+                    out.push(row);
+                }
+            }
+            if !out.is_empty() {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -601,6 +727,8 @@ struct Context {
     width: usize,
     /// The query's `as_of`.
     as_of: Option<u64>,
+    /// Whether to use the reduction: whether the graph is as it was planned.
+    reduced: bool,
 }
 
 impl Context {
@@ -621,15 +749,35 @@ impl Context {
                     join,
                     access,
                     keys,
+                    reduced,
+                    required,
+                    candidates,
                     ..
                 } => {
+                    let reduced = reduced.clone().filter(|_| *required || self.reduced);
+                    let candidates = candidates.clone().filter(|_| self.reduced);
+                    let access = match (&reduced, access) {
+                        // The reduction can not be used: look the pattern
+                        // up by what is bound.
+                        (None, Access::All) => Access::of(
+                            pattern.link.is_some_and(|v| bound[v.0]),
+                            pattern.terms().map(|t| match t {
+                                Term::Id(_) => true,
+                                Term::Var(v) => *join == Join::Bind && bound[v.0],
+                            }),
+                        ),
+                        (_, access) => *access,
+                    };
                     let scan = |input, bound: &[bool]| BindJoin {
                         input,
                         matcher: Matcher {
                             pattern: *pattern,
-                            access: *access,
+                            access,
                             bound: bound.to_vec(),
                             as_of: pattern.as_of.or(self.as_of),
+                            reduced: reduced.clone(),
+                            index: None,
+                            candidates: candidates.clone(),
                         },
                         in_batch: Batch::new(width),
                         in_pos: 0,
@@ -703,6 +851,25 @@ impl Context {
                     ctx: *self,
                     once: (*join == Join::Hash).then_some(None),
                 }),
+                Step::NotChange {
+                    old,
+                    new,
+                    keys,
+                    flips,
+                    flip_vars,
+                    to_unmatched,
+                    ..
+                } => Box::new(NotChange {
+                    input: op,
+                    old: old.clone(),
+                    new: new.clone(),
+                    keys: keys.clone(),
+                    flips: flips.clone(),
+                    flip_vars: flip_vars.clone(),
+                    to_unmatched: *to_unmatched,
+                    bound: bound.to_vec(),
+                    ctx: *self,
+                }),
             };
         }
         op
@@ -761,6 +928,7 @@ impl Plan {
         let ctx = Context {
             width: q.names.len().max(1),
             as_of: q.as_of,
+            reduced: g.next_id() == self.next_id,
         };
         let mut op = ctx.build(&self.root, unit(ctx.width), &mut vec![false; ctx.width]);
         let select = q.selected();

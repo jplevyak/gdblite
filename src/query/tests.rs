@@ -195,10 +195,17 @@ fn check_rows(q: &Query, g: &Graph, rows: Vec<Vec<u64>>, expected: &[Vec<u64>], 
 /// wherever it can be.
 fn check(q: &Query, g: &Graph) {
     let expected = BruteForce::rows(q, g);
-    for force in [None, Some(Join::Bind), Some(Join::Hash)] {
-        let plan = plan::plan_with(q, g, force).unwrap();
-        let rows: Vec<Vec<u64>> = plan.execute(g).collect::<Result<_>>().unwrap();
-        check_rows(q, g, rows, &expected, &plan.explain());
+    // With a full reduction, none, and one stopped early.
+    for budget in [None, Some(0), Some(3)] {
+        let mut q = q.clone();
+        if let Some(b) = budget {
+            q.reduction_budget(b);
+        }
+        for force in [None, Some(Join::Bind), Some(Join::Hash)] {
+            let plan = plan::plan_with(&q, g, force).unwrap();
+            let rows: Vec<Vec<u64>> = plan.execute(g).collect::<Result<_>>().unwrap();
+            check_rows(&q, g, rows, &expected, &plan.explain());
+        }
     }
 }
 
@@ -465,6 +472,15 @@ fn planner_picks_selective_pattern_first() {
     let mut q = Query::new();
     let x = q.var("x");
     q.pattern(x, kind, person).pattern(x, name, bob_name);
+    // Reduced first: by name, then the one person's type.
+    let plan = q.plan(&g).unwrap();
+    assert!(
+        plan.reduction.as_ref().unwrap().entries < 10,
+        "{}",
+        plan.explain()
+    );
+    assert_eq!(plan.execute(&g).count(), 1);
+    q.reduction_budget(0);
     let plan = q.plan(&g).unwrap();
     let (pattern, access) = first_step(&plan);
     assert_eq!(pattern.object, Term::Id(bob_name), "{}", plan.explain());
@@ -578,7 +594,8 @@ fn constants_links_and_filters() {
     // A filter without variables.
     q2.filter(Filter::Eq(Term::Id(1), Term::Id(2)));
     assert!(q2.run(&g).unwrap().is_empty());
-    assert!(q2.plan(&g).unwrap().explain().starts_with("filter 1 = 2"));
+    let explain = q2.plan(&g).unwrap().explain();
+    assert!(explain.contains("\nfilter 1 = 2"), "{explain}");
 }
 
 #[test]
@@ -828,4 +845,235 @@ fn errors() {
     let x = q.var("x");
     q.pattern(x, 1, 2).not(Group::new());
     assert!(matches!(q.plan(&g), Err(Error::InvalidArgument(_))));
+}
+
+#[test]
+fn reduction() {
+    let mut g = graph();
+    let (kind, person, knows, city) = (
+        g.value(b"type").unwrap(),
+        g.value(b"Person").unwrap(),
+        g.value(b"knows").unwrap(),
+        g.value(b"city").unwrap(),
+    );
+    let paris = g.value(b"Paris").unwrap();
+    // Many people, each knowing the next; only a few in Paris.
+    let people: Vec<u64> = (0..500).map(|_| g.node().unwrap()).collect();
+    for (i, &p) in people.iter().enumerate() {
+        g.link(p, kind, person).unwrap();
+        g.link(p, knows, people[(i + 1) % people.len()]).unwrap();
+        if i % 100 == 0 {
+            g.link(p, city, paris).unwrap();
+        }
+    }
+    // People in Paris who know a person who knows a person.
+    let mut q = Query::new();
+    let (x, y, z) = (q.var("x"), q.var("y"), q.var("z"));
+    q.pattern(x, city, paris)
+        .pattern(x, knows, y)
+        .pattern(y, knows, z)
+        .pattern(z, kind, person);
+    let plan = q.plan(&g).unwrap();
+    let explain = plan.explain();
+    // The reduction narrows every variable to the 5 people in Paris and
+    // those they reach, without reading the 500 type links.
+    assert!(
+        explain.starts_with("reduce: ?x 5, ?y 5, ?z 5 candidates"),
+        "{explain}"
+    );
+    let r = plan.reduction.as_ref().unwrap();
+    assert!(r.complete && r.entries < 100, "{explain}");
+    assert!(explain.contains("5 reduced links"), "{explain}");
+    assert_eq!(plan.execute(&g).count(), 5);
+    check(&q, &g);
+
+    // A small budget stops it early; the rows are the same.
+    q.reduction_budget(8);
+    let plan = q.plan(&g).unwrap();
+    assert!(
+        plan.explain().contains("stopped at budget"),
+        "{}",
+        plan.explain()
+    );
+    assert!(!plan.reduction.as_ref().unwrap().complete);
+    assert_eq!(plan.execute(&g).count(), 5);
+
+    // A plan whose graph has changed does not use its reduction.
+    let mut q = Query::new();
+    let x = q.var("x");
+    q.pattern(x, city, paris);
+    let plan = q.plan(&g).unwrap();
+    assert_eq!(plan.execute(&g).count(), 5);
+    g.link(people[1], city, paris).unwrap();
+    assert_eq!(plan.execute(&g).count(), 6);
+
+    // An empty reduction: nobody in Paris knows themselves.
+    let mut q = Query::new();
+    let x = q.var("x");
+    q.pattern(x, city, paris).pattern(x, knows, x);
+    let plan = q.plan(&g).unwrap();
+    assert!(plan.explain().contains("?x 0"), "{}", plan.explain());
+    assert_eq!(plan.execute(&g).count(), 0);
+
+    // Filters on one variable narrow its candidates.
+    let mut q = Query::new();
+    let x = q.var("x");
+    q.pattern(x, city, paris)
+        .filter(Filter::Ne(x.into(), people[0].into()));
+    assert!(q.plan(&g).unwrap().explain().starts_with("reduce: ?x 5"));
+    assert_eq!(q.run(&g).unwrap().len(), 5);
+}
+
+/// The rows of `q` on the entries of `g` committed before `at`.
+fn committed_rows(q: &Query, g: &Graph, at: u64) -> Vec<Vec<u64>> {
+    let mut q = q.clone();
+    q.as_of(at - 1);
+    sorted(BruteForce::rows(&q, g))
+}
+
+/// Random changes to a random graph: new links and deletions.
+fn mutate(rng: &mut Rng, g: &mut Graph, nodes: &[u64], predicates: &[u64]) {
+    for _ in 0..3 + rng.below(12) {
+        let (s, p, o) = (rng.pick(nodes), rng.pick(predicates), rng.pick(nodes));
+        if rng.chance(35) {
+            g.delete_link(s, p, o).unwrap();
+        } else {
+            let l = g.link(s, p, o).unwrap();
+            if rng.chance(10) {
+                g.link(l, rng.pick(predicates), rng.pick(nodes)).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn standing_queries() {
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let (mut changed, mut unions, mut nots) = (0, 0, 0);
+    for _ in 0..6 {
+        let (mut g, nodes, predicates) = random_graph(&mut rng);
+        g.commit().unwrap();
+        let ids = (g.start_id(), g.next_id());
+        for _ in 0..40 {
+            let mut q = Generator {
+                rng: &mut rng,
+                nodes: &nodes,
+                predicates: &predicates,
+                ids,
+            }
+            .query();
+            q.limit = None;
+            q.order.clear();
+            q.as_of = None;
+            let mut standing = StandingQuery::new(&q, &g).unwrap();
+            assert_eq!(standing.rows(), committed_rows(&q, &g, standing.at()));
+            for _ in 0..4 {
+                let before = standing.rows();
+                mutate(&mut rng, &mut g, &nodes, &predicates);
+                let committed = rng.chance(75);
+                if committed {
+                    g.commit().unwrap();
+                }
+                let changes = standing.update(&g).unwrap();
+                let after = standing.rows();
+                assert_eq!(after, committed_rows(&q, &g, standing.at()), "{q:?}");
+                if !committed {
+                    assert!(changes.is_empty());
+                }
+                // The changes are the difference.
+                let mut expect = before.clone();
+                for (row, n) in &changes.removed {
+                    for _ in 0..*n {
+                        let i = expect.iter().position(|r| r == row).expect("removed row");
+                        expect.remove(i);
+                    }
+                }
+                for (row, n) in &changes.added {
+                    expect.extend(std::iter::repeat_n(row.clone(), *n as usize));
+                }
+                assert_eq!(sorted(expect), after, "{q:?}");
+                if !changes.is_empty() {
+                    changed += 1;
+                    unions += usize::from(!q.root.unions.is_empty());
+                    nots += usize::from(!q.root.nots.is_empty());
+                }
+            }
+            g.commit().unwrap();
+        }
+    }
+    // The changes are not trivial.
+    assert!(
+        changed > 50 && unions > 5 && nots > 5,
+        "{changed} {unions} {nots}"
+    );
+}
+
+#[test]
+fn standing_query_changes() {
+    let mut g = graph();
+    let knows = g.value(b"knows").unwrap();
+    let blocked = g.value(b"blocked").unwrap();
+    let [a, b, c, d] = [(); 4].map(|_| g.node().unwrap());
+    g.link(a, knows, b).unwrap();
+    g.commit().unwrap();
+
+    // Friends of friends of a, not blocked by a.
+    let mut q = Query::new();
+    let (x, y) = (q.var("x"), q.var("y"));
+    let mut is_blocked = Group::new();
+    is_blocked.pattern(a, blocked, y);
+    q.pattern(a, knows, x)
+        .pattern(x, knows, y)
+        .not(is_blocked)
+        .select([y]);
+    let mut s = StandingQuery::new(&q, &g).unwrap();
+    assert!(s.rows().is_empty());
+
+    g.link(b, knows, c).unwrap();
+    g.link(b, knows, d).unwrap();
+    // Not committed yet.
+    assert!(s.update(&g).unwrap().is_empty());
+    g.commit().unwrap();
+    let changes = s.update(&g).unwrap();
+    assert_eq!(changes.added, [(vec![c], 1), (vec![d], 1)]);
+    assert!(changes.removed.is_empty());
+
+    // Blocking d removes it; deleting a's link to b removes c too.
+    g.link(a, blocked, d).unwrap();
+    g.commit().unwrap();
+    assert_eq!(s.update(&g).unwrap().removed, [(vec![d], 1)]);
+    g.delete_link(a, knows, b).unwrap();
+    g.commit().unwrap();
+    assert_eq!(s.update(&g).unwrap().removed, [(vec![c], 1)]);
+    assert!(s.rows().is_empty());
+
+    // Unblocking d while knowing b again brings back both.
+    g.link(a, knows, b).unwrap();
+    g.delete_link(a, blocked, d).unwrap();
+    g.commit().unwrap();
+    assert_eq!(s.update(&g).unwrap().added, [(vec![c], 1), (vec![d], 1)]);
+
+    // A distinct query reports a row once, while any of its matches remain.
+    let mut q = Query::new();
+    let (x, y) = (q.var("x"), q.var("y"));
+    q.pattern(x, knows, y).select([x]).distinct();
+    let mut s = StandingQuery::new(&q, &g).unwrap();
+    assert_eq!(s.rows(), [[a], [b]]);
+    g.delete_link(b, knows, c).unwrap();
+    g.commit().unwrap();
+    assert!(s.update(&g).unwrap().is_empty());
+    g.delete_link(b, knows, d).unwrap();
+    g.commit().unwrap();
+    assert_eq!(s.update(&g).unwrap().removed, [(vec![b], 1)]);
+
+    // What a standing query can not keep.
+    let mut q2 = q.clone();
+    q2.limit(1);
+    assert!(StandingQuery::new(&q2, &g).is_err());
+    let mut q2 = q.clone();
+    q2.order_by(SortKey::id(x));
+    assert!(StandingQuery::new(&q2, &g).is_err());
+    let mut q2 = q.clone();
+    q2.as_of(1);
+    assert!(StandingQuery::new(&q2, &g).is_err());
 }

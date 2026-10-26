@@ -55,7 +55,17 @@
 //!
 //! # Planning
 //!
-//! [`Query::plan`] orders the patterns and unions of each group to minimize
+//! [`Query::plan`] first *reduces* the top group's patterns: by constraint
+//! propagation, as the C++ GraQL evaluator did, it narrows each variable to
+//! a set of candidate ids and each pattern to its candidate links, starting
+//! from the constants and the most selective patterns, until nothing changes
+//! or a budget of index entries read
+//! ([`reduction_budget`](Query::reduction_budget)) is spent.  The joins then
+//! read the reduced links rather than the indexes, and their estimates are
+//! exact.  A plan only uses its reduction while the graph is as it was when
+//! planned.
+//!
+//! It then orders the patterns and unions of each group to minimize
 //! an estimated cost, using the counts of the indexes for constants and the
 //! graph's [`Stats`](crate::stats::Stats) for variables, and chooses for
 //! each how to join it:
@@ -72,6 +82,13 @@
 //! group are bound.  Up to [`EXHAUSTIVE_PATTERNS`] patterns and unions of a
 //! group are planned exhaustively over left-deep orders, more greedily.
 //!
+//! # Standing queries
+//!
+//! A [`StandingQuery`] keeps a query's rows up to date as entries are
+//! committed: each [`update`](StandingQuery::update) works out the
+//! [`Changes`] from the links committed since, without evaluating the query
+//! again.
+//!
 //! # Results
 //!
 //! [`Plan::execute`] returns the rows as they are produced, so a limit or a
@@ -81,6 +98,7 @@
 //! patterns binding every variable are distinct, but selecting fewer
 //! variables, or unions, can repeat rows.
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
@@ -89,11 +107,15 @@ use crate::graph::{Error, Graph, Result};
 
 mod exec;
 mod plan;
+mod reduce;
+mod standing;
 #[cfg(test)]
 mod tests;
 
 pub use exec::Rows;
 pub use plan::{EXHAUSTIVE_PATTERNS, Plan};
+pub use reduce::DEFAULT_REDUCTION_BUDGET;
+pub use standing::{Changes, StandingQuery};
 
 /// A query variable, made by [`Query::var`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -171,9 +193,52 @@ pub enum Filter {
     Ne(Term, Term),
     /// The first id is less than the second: useful for breaking symmetry.
     Lt(Term, Term),
+    /// The data of the first value compares to the second's as given:
+    /// numerically if both are numbers, else by bytes.  Fails for ids
+    /// without data.
+    Compare(Term, Cmp, Term),
     /// `test(graph, id)` holds for the id bound to the variable, for example
     /// a test of the data of a value.
     Test(Var, Test),
+}
+
+/// A comparison of the data of two values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl Cmp {
+    /// Whether `ordering` satisfies the comparison.
+    pub fn holds(self, ordering: Ordering) -> bool {
+        match self {
+            Cmp::Lt => ordering.is_lt(),
+            Cmp::Le => ordering.is_le(),
+            Cmp::Gt => ordering.is_gt(),
+            Cmp::Ge => ordering.is_ge(),
+        }
+    }
+
+    fn symbol(self) -> &'static str {
+        match self {
+            Cmp::Lt => "<",
+            Cmp::Le => "<=",
+            Cmp::Gt => ">",
+            Cmp::Ge => ">=",
+        }
+    }
+}
+
+/// Compares two data: numerically if both are numbers, else by bytes.
+pub fn compare_data(a: &[u8], b: &[u8]) -> Ordering {
+    let number = |d: &[u8]| std::str::from_utf8(d).ok()?.trim().parse::<f64>().ok();
+    match (number(a), number(b)) {
+        (Some(x), Some(y)) => x.total_cmp(&y),
+        _ => a.cmp(b),
+    }
 }
 
 impl fmt::Debug for Filter {
@@ -182,6 +247,7 @@ impl fmt::Debug for Filter {
             Filter::Eq(a, b) => write!(f, "Eq({a:?}, {b:?})"),
             Filter::Ne(a, b) => write!(f, "Ne({a:?}, {b:?})"),
             Filter::Lt(a, b) => write!(f, "Lt({a:?}, {b:?})"),
+            Filter::Compare(a, c, b) => write!(f, "Compare({a:?}, {c:?}, {b:?})"),
             Filter::Test(v, _) => write!(f, "Test({v:?})"),
         }
     }
@@ -190,7 +256,7 @@ impl fmt::Debug for Filter {
 impl Filter {
     fn vars(&self) -> Vec<Var> {
         match self {
-            Filter::Eq(a, b) | Filter::Ne(a, b) | Filter::Lt(a, b) => {
+            Filter::Eq(a, b) | Filter::Ne(a, b) | Filter::Lt(a, b) | Filter::Compare(a, _, b) => {
                 [a, b].into_iter().filter_map(|t| t.var()).collect()
             }
             Filter::Test(v, _) => vec![*v],
@@ -207,6 +273,10 @@ impl Filter {
             Filter::Eq(a, b) => id(a) == id(b),
             Filter::Ne(a, b) => id(a) != id(b),
             Filter::Lt(a, b) => id(a) < id(b),
+            Filter::Compare(a, c, b) => match (g.data(id(a)), g.data(id(b))) {
+                (Some(x), Some(y)) => c.holds(compare_data(x, y)),
+                _ => false,
+            },
             Filter::Test(v, test) => test(g, row[v.0]),
         }
     }
@@ -216,7 +286,7 @@ impl Filter {
         match self {
             Filter::Eq(..) => 0.1,
             Filter::Ne(..) => 0.9,
-            Filter::Lt(..) => 0.5,
+            Filter::Lt(..) | Filter::Compare(..) => 0.5,
             Filter::Test(..) => 0.5,
         }
     }
@@ -390,6 +460,7 @@ pub struct Query {
     order: Vec<SortKey>,
     limit: Option<usize>,
     as_of: Option<u64>,
+    reduction_budget: Option<u64>,
 }
 
 impl Query {
@@ -487,6 +558,14 @@ impl Query {
         self
     }
 
+    /// Limits the reduction of the top group to reading about `entries`
+    /// index entries ([`DEFAULT_REDUCTION_BUDGET`] by default); 0 turns it
+    /// off.
+    pub fn reduction_budget(&mut self, entries: u64) -> &mut Self {
+        self.reduction_budget = Some(entries);
+        self
+    }
+
     /// The patterns of the top group.
     pub fn patterns(&self) -> &[Pattern] {
         &self.root.patterns
@@ -563,6 +642,12 @@ impl Query {
             Filter::Eq(a, b) => format!("{} = {}", self.term_name(*a), self.term_name(*b)),
             Filter::Ne(a, b) => format!("{} != {}", self.term_name(*a), self.term_name(*b)),
             Filter::Lt(a, b) => format!("{} < {}", self.term_name(*a), self.term_name(*b)),
+            Filter::Compare(a, c, b) => format!(
+                "data({}) {} data({})",
+                self.term_name(*a),
+                c.symbol(),
+                self.term_name(*b)
+            ),
             Filter::Test(v, _) => format!("test({})", self.var_name(*v)),
         }
     }
