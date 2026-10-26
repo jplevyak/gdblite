@@ -36,6 +36,11 @@
 //!   or for each match of the pattern, creating the nodes, values and keys
 //!   the template names; a blank node in it is a new node each time.
 //! - `delete template [where pattern]` deletes them.
+//! - `rule name(?x ?y) pattern` defines the relation `name` as the values
+//!   of its head variables in each match of the pattern, for the rest of
+//!   the [`Session`].  Several rules may define a relation, and rules may
+//!   call themselves and each other, but not within a negation of
+//!   themselves.
 //!
 //! The changes are not committed.
 //!
@@ -53,18 +58,21 @@
 //! - Comparisons are subjects: `?x = ?y` and `?x != ?y` compare ids, which
 //!   for values is their data; `<`, `<=`, `>` and `>=` compare data,
 //!   numerically if both are numbers.
+//! - `s p++ o` holds where a chain of one or more `p` links joins `s` to
+//!   `o`.
+//! - A call of a rule, `name(?x ?y)`, is a subject matching its relation.
 //!
 //! The rest of the C++ grammar parses but is reported as unsupported:
-//! optional and other predicate modifiers, transitive predicates (`++`),
-//! author and subgraph positions, `let`, `implies`, `else`, expressions,
-//! lists, rules, functions, named graphs and the other statements.
+//! optional and other predicate modifiers, author and subgraph positions,
+//! `let`, `implies`, `else`, expressions, lists, functions, named graphs and
+//! the other statements.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
 use crate::graph::{self, Graph};
-use crate::query::{Cmp, Filter, Group, Query, SortKey, Term, Var, compare_data};
+use crate::query::{Cmp, Filter, Group, Query, Relation, SortKey, Term, Var, compare_data};
 
 /// Errors from parsing or running GraQL.
 #[derive(Debug)]
@@ -325,15 +333,30 @@ pub enum Comparison {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     Triple(Node, Node, Node),
+    /// A transitive predicate: `s p++ o`.
+    Path(Node, Node, Node),
+    /// A call to a rule: `name(args)`.
+    Call(String, Vec<Node>),
     Compare(Node, Comparison, Node),
     And(Vec<Pattern>),
     Or(Vec<Pattern>),
     Not(Box<Pattern>),
 }
 
+/// A rule: its relation's name, head variables and body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleDef {
+    pub name: String,
+    pub head: Vec<String>,
+    pub body: Pattern,
+}
+
 /// A parsed statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
+    /// `rule name(?a ?b) pattern`: defines `name` for the rest of the
+    /// session.
+    Rule(RuleDef),
     Select {
         distinct: bool,
         /// The variables, or `None` for all.
@@ -445,6 +468,20 @@ impl Parser {
                 } else {
                     Statement::Delete { template, pattern }
                 })
+            }
+            Token::Keyword("rule") => {
+                let name = match self.next() {
+                    Token::Ident(name) => name,
+                    t => return self.syntax(format!("expected a rule's name, found {t}")),
+                };
+                self.expect(&Token::Punct("("))?;
+                let mut head = Vec::new();
+                while !self.punct(")") {
+                    head.push(self.var()?);
+                    self.punct(",");
+                }
+                let body = self.pattern()?;
+                Ok(Statement::Rule(RuleDef { name, head, body }))
             }
             Token::Keyword(k) => Err(Error::Unsupported {
                 line,
@@ -621,14 +658,36 @@ impl Parser {
         )
     }
 
-    /// `subject: not node predicates | node predicate_phrase`; calls are
-    /// not supported.
+    /// `subject: call | not node predicates | node predicate_phrase`.
     fn subject(&mut self) -> Result<Pattern> {
         let negated = self.keyword("not");
         let mut out = Vec::new();
+        let is_call = matches!(self.peek(), Token::Ident(_))
+            && self.tokens.get(self.pos + 1).map(|t| &t.token) == Some(&Token::Punct("("));
+        if is_call {
+            let Token::Ident(name) = self.next() else {
+                unreachable!()
+            };
+            self.next();
+            let mut args = Vec::new();
+            while !self.punct(")") {
+                args.push(self.node(&mut out)?);
+                self.punct(",");
+            }
+            if self.is(&Token::Punct("@")) {
+                return self.unsupported("'@'");
+            }
+            out.push(Pattern::Call(name, args));
+            let p = Pattern::And(out);
+            return Ok(if negated {
+                Pattern::Not(Box::new(p))
+            } else {
+                p
+            });
+        }
         let node = self.node(&mut out)?;
         if self.is(&Token::Punct("(")) {
-            return self.unsupported("a call");
+            return self.unsupported("a call of a non-rule");
         }
         let cmp = match self.peek() {
             Token::Punct("=") | Token::Punct("==") => Some(Comparison::Eq),
@@ -672,16 +731,18 @@ impl Parser {
                 }
                 _ => self.node(out)?,
             };
-            if self.is(&Token::Punct("++")) {
-                return self.unsupported("transitive predicates");
-            }
+            let transitive = self.punct("++");
             loop {
                 let object_negated = self.keyword("not");
                 let object = self.object(out)?;
                 if self.starts_node() {
                     return self.unsupported("author and subgraph positions");
                 }
-                let triple = Pattern::Triple(subject.clone(), predicate.clone(), object);
+                let triple = if transitive {
+                    Pattern::Path(subject.clone(), predicate.clone(), object)
+                } else {
+                    Pattern::Triple(subject.clone(), predicate.clone(), object)
+                };
                 out.push(if negated || object_negated {
                     Pattern::Not(Box::new(triple))
                 } else {
@@ -825,6 +886,7 @@ struct Lowering<'g> {
     g: &'g Graph,
     query: Query,
     vars: HashMap<String, Var>,
+    relations: HashMap<String, Relation>,
 }
 
 impl Lowering<'_> {
@@ -847,17 +909,30 @@ impl Lowering<'_> {
         }
     }
 
-    fn group(&mut self, p: &Pattern) -> Group {
+    fn group(&mut self, p: &Pattern) -> Result<Group> {
         let mut group = Group::new();
-        self.add(&mut group, p);
-        group
+        self.add(&mut group, p)?;
+        Ok(group)
     }
 
-    fn add(&mut self, group: &mut Group, p: &Pattern) {
+    fn add(&mut self, group: &mut Group, p: &Pattern) -> Result<()> {
         match p {
             Pattern::Triple(s, pr, o) => {
                 let (s, pr, o) = (self.term(s), self.term(pr), self.term(o));
                 group.pattern(s, pr, o);
+            }
+            Pattern::Path(s, pr, o) => {
+                let (s, pr, o) = (self.term(s), self.term(pr), self.term(o));
+                group.path(s, pr, o);
+            }
+            Pattern::Call(name, args) => {
+                let relation = *self.relations.get(name).ok_or_else(|| Error::Syntax {
+                    line: 0,
+                    column: 0,
+                    message: format!("unknown rule '{name}'"),
+                })?;
+                let args: Vec<Term> = args.iter().map(|a| self.term(a)).collect();
+                group.call(relation, args);
             }
             Pattern::Compare(a, cmp, b) => {
                 let (ta, tb) = (self.term(a), self.term(b));
@@ -887,18 +962,20 @@ impl Lowering<'_> {
             }
             Pattern::And(ps) => {
                 for p in ps {
-                    self.add(group, p);
+                    self.add(group, p)?;
                 }
             }
             Pattern::Or(ps) => {
-                let branches: Vec<Group> = ps.iter().map(|p| self.group(p)).collect();
+                let branches: Vec<Group> =
+                    ps.iter().map(|p| self.group(p)).collect::<Result<_>>()?;
                 group.union(branches);
             }
             Pattern::Not(p) => {
-                let not = self.group(p);
+                let not = self.group(p)?;
                 group.not(not);
             }
         }
+        Ok(())
     }
 }
 
@@ -912,16 +989,28 @@ fn flip(c: Cmp) -> Cmp {
     }
 }
 
-/// The query of a pattern, and its variables by name.
-fn lower(g: &Graph, p: &Pattern) -> (Query, HashMap<String, Var>) {
+/// The query of a pattern, with `rules`, and its variables by name.
+fn lower(g: &Graph, rules: &[RuleDef], p: &Pattern) -> Result<(Query, HashMap<String, Var>)> {
     let mut l = Lowering {
         g,
         query: Query::new(),
         vars: HashMap::new(),
+        relations: HashMap::new(),
     };
-    let root = l.group(p);
+    for rule in rules {
+        if !l.relations.contains_key(&rule.name) {
+            let r = l.query.relation(&rule.name, rule.head.len());
+            l.relations.insert(rule.name.clone(), r);
+        }
+    }
+    for rule in rules {
+        let body = l.group(&rule.body)?;
+        let head: Vec<Var> = rule.head.iter().map(|v| l.var(v)).collect();
+        l.query.rule(l.relations[&rule.name], head, body);
+    }
+    let root = l.group(p)?;
     *l.query.group() = root;
-    (l.query, l.vars)
+    Ok((l.query, l.vars))
 }
 
 /// The names of the variables (and blank nodes, if `blanks`) every row of
@@ -929,8 +1018,17 @@ fn lower(g: &Graph, p: &Pattern) -> (Query, HashMap<String, Var>) {
 fn bound_names(p: &Pattern, blanks: bool) -> Vec<String> {
     fn collect(p: &Pattern, blanks: bool, out: &mut Vec<String>) {
         match p {
-            Pattern::Triple(s, pr, o) => {
+            Pattern::Triple(s, pr, o) | Pattern::Path(s, pr, o) => {
                 for n in [s, pr, o] {
+                    match n {
+                        Node::Var(name) => out.push(name.clone()),
+                        Node::Blank(name) if blanks => out.push(name.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            Pattern::Call(_, args) => {
+                for n in args {
                     match n {
                         Node::Var(name) => out.push(name.clone()),
                         Node::Blank(name) if blanks => out.push(name.clone()),
@@ -960,7 +1058,7 @@ fn triples(p: &Pattern, out: &mut Vec<(Node, Node, Node)>) {
     match p {
         Pattern::Triple(s, pr, o) => out.push((s.clone(), pr.clone(), o.clone())),
         Pattern::And(ps) | Pattern::Or(ps) => ps.iter().for_each(|p| triples(p, out)),
-        Pattern::Compare(..) | Pattern::Not(_) => {}
+        Pattern::Compare(..) | Pattern::Not(_) | Pattern::Path(..) | Pattern::Call(..) => {}
     }
 }
 
@@ -968,6 +1066,11 @@ impl Statement {
     /// The query of a `select`, `verify` or `lookup` statement against `g`,
     /// and the names of the variables its rows return.
     pub fn query(&self, g: &Graph) -> Result<(Query, Vec<String>)> {
+        self.query_with(g, &[])
+    }
+
+    /// The same, with `rules` defined.
+    pub fn query_with(&self, g: &Graph, rules: &[RuleDef]) -> Result<(Query, Vec<String>)> {
         let unsupported = |what: &str| Error::Unsupported {
             line: 0,
             column: 0,
@@ -981,7 +1084,7 @@ impl Statement {
                 pattern,
                 limit,
             } => {
-                let (mut q, map) = lower(g, pattern);
+                let (mut q, map) = lower(g, rules, pattern)?;
                 let names = match vars {
                     Some(vars) => vars.clone(),
                     None => bound_names(pattern, false),
@@ -1007,12 +1110,12 @@ impl Statement {
                 Ok((q, names))
             }
             Statement::Verify(pattern) => {
-                let (mut q, _) = lower(g, pattern);
+                let (mut q, _) = lower(g, rules, pattern)?;
                 q.select([]).limit(1);
                 Ok((q, Vec::new()))
             }
             Statement::Lookup(pattern) => {
-                let (mut q, map) = lower(g, pattern);
+                let (mut q, map) = lower(g, rules, pattern)?;
                 let names = bound_names(pattern, true);
                 q.select(names.iter().map(|n| map[n]));
                 Ok((q, names))
@@ -1038,15 +1141,21 @@ pub enum Output {
     Inserted(usize),
     /// The links a `delete` deleted.
     Deleted(usize),
+    /// The rule a `rule` defined.
+    Defined(String),
 }
 
 /// The values of a pattern's variables in each of its rows (or a single row
 /// binding nothing, with no pattern).
-fn bindings(g: &Graph, pattern: Option<&Pattern>) -> Result<Vec<HashMap<String, u64>>> {
+fn bindings(
+    g: &Graph,
+    rules: &[RuleDef],
+    pattern: Option<&Pattern>,
+) -> Result<Vec<HashMap<String, u64>>> {
     let Some(pattern) = pattern else {
         return Ok(vec![HashMap::new()]);
     };
-    let (mut q, map) = lower(g, pattern);
+    let (mut q, map) = lower(g, rules, pattern)?;
     let names = bound_names(pattern, true);
     q.select(names.iter().map(|n| map[n]));
     let rows = q.run(g)?;
@@ -1056,108 +1165,139 @@ fn bindings(g: &Graph, pattern: Option<&Pattern>) -> Result<Vec<HashMap<String, 
         .collect())
 }
 
-/// Runs a parsed statement on `g`.
+/// Runs a parsed statement on `g`, with no rules defined.
 pub fn run(g: &mut Graph, statement: &Statement) -> Result<Output> {
-    match statement {
-        Statement::Select { .. } => {
-            let (q, vars) = statement.query(g)?;
-            Ok(Output::Rows {
-                vars,
-                rows: q.run(g)?,
-            })
-        }
-        Statement::Verify(_) => {
-            let (q, _) = statement.query(g)?;
-            Ok(Output::Verified(!q.run(g)?.is_empty()))
-        }
-        Statement::Lookup(pattern) => {
-            let mut links = BTreeSet::new();
-            let mut positive = Vec::new();
-            triples(pattern, &mut positive);
-            for row in bindings(g, Some(pattern))? {
-                for (s, p, o) in &positive {
-                    let id = |n: &Node| match n {
-                        Node::Var(v) | Node::Blank(v) => row.get(v).copied(),
-                        Node::Key(k) => g.find_by_key(k.as_bytes()),
-                        Node::Value(v) => g.find_value(v.as_bytes()),
-                    };
-                    if let (Some(s), Some(p), Some(o)) = (id(s), id(p), id(o))
-                        && let Some(l) = g.find_link(s, p, o)
-                    {
-                        links.insert(l);
+    Session::new().run(g, statement)
+}
+
+/// Statements run in turn, with the rules defined by those before.
+#[derive(Debug, Clone, Default)]
+pub struct Session {
+    rules: Vec<RuleDef>,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parses and runs GraQL statements on `g`, returning each one's
+    /// output.
+    pub fn execute(&mut self, g: &mut Graph, text: &str) -> Result<Vec<Output>> {
+        parse(text)?.iter().map(|s| self.run(g, s)).collect()
+    }
+
+    /// Runs a parsed statement on `g`.
+    pub fn run(&mut self, g: &mut Graph, statement: &Statement) -> Result<Output> {
+        let rules = &self.rules;
+        match statement {
+            Statement::Rule(rule) => {
+                self.rules.push(rule.clone());
+                Ok(Output::Defined(rule.name.clone()))
+            }
+            Statement::Select { .. } => {
+                let (q, vars) = statement.query_with(g, rules)?;
+                Ok(Output::Rows {
+                    vars,
+                    rows: q.run(g)?,
+                })
+            }
+            Statement::Verify(_) => {
+                let (q, _) = statement.query_with(g, rules)?;
+                Ok(Output::Verified(!q.run(g)?.is_empty()))
+            }
+            Statement::Lookup(pattern) => {
+                let mut links = BTreeSet::new();
+                let mut positive = Vec::new();
+                triples(pattern, &mut positive);
+                for row in bindings(g, rules, Some(pattern))? {
+                    for (s, p, o) in &positive {
+                        let id = |n: &Node| match n {
+                            Node::Var(v) | Node::Blank(v) => row.get(v).copied(),
+                            Node::Key(k) => g.find_by_key(k.as_bytes()),
+                            Node::Value(v) => g.find_value(v.as_bytes()),
+                        };
+                        if let (Some(s), Some(p), Some(o)) = (id(s), id(p), id(o))
+                            && let Some(l) = g.find_link(s, p, o)
+                        {
+                            links.insert(l);
+                        }
                     }
                 }
+                Ok(Output::Links(links.into_iter().collect()))
             }
-            Ok(Output::Links(links.into_iter().collect()))
-        }
-        Statement::Insert { template, pattern } | Statement::Delete { template, pattern } => {
-            let insert = matches!(statement, Statement::Insert { .. });
-            let bound = pattern
-                .as_ref()
-                .map(|p| bound_names(p, true))
-                .unwrap_or_default();
-            let unbound = template.iter().any(|(s, p, o)| {
-                [s, p, o]
-                    .iter()
-                    .any(|n| matches!(n, Node::Var(v) if !bound.contains(v)))
-            });
-            if unbound {
-                return Err(Error::Syntax {
-                    line: 0,
-                    column: 0,
-                    message: "a template variable is not bound by the pattern".into(),
+            Statement::Insert { template, pattern } | Statement::Delete { template, pattern } => {
+                let insert = matches!(statement, Statement::Insert { .. });
+                let bound = pattern
+                    .as_ref()
+                    .map(|p| bound_names(p, true))
+                    .unwrap_or_default();
+                let unbound = template.iter().any(|(s, p, o)| {
+                    [s, p, o]
+                        .iter()
+                        .any(|n| matches!(n, Node::Var(v) if !bound.contains(v)))
                 });
-            }
-            let mut count = 0;
-            for row in bindings(g, pattern.as_ref())? {
-                // A blank node of the template is a new node for each row.
-                let mut blanks: HashMap<String, u64> = HashMap::new();
-                for (s, p, o) in template {
-                    let mut id = |g: &mut Graph, n: &Node| -> graph::Result<Option<u64>> {
-                        Ok(match n {
-                            Node::Var(v) | Node::Blank(v) if row.contains_key(v) => Some(row[v]),
-                            Node::Var(_) => None,
-                            Node::Blank(b) if insert => Some(match blanks.get(b) {
-                                Some(&id) => id,
-                                None => {
-                                    let id = g.node()?;
-                                    blanks.insert(b.clone(), id);
-                                    id
+                if unbound {
+                    return Err(Error::Syntax {
+                        line: 0,
+                        column: 0,
+                        message: "a template variable is not bound by the pattern".into(),
+                    });
+                }
+                let mut count = 0;
+                for row in bindings(g, rules, pattern.as_ref())? {
+                    // A blank node of the template is a new node for each row.
+                    let mut blanks: HashMap<String, u64> = HashMap::new();
+                    for (s, p, o) in template {
+                        let mut id = |g: &mut Graph, n: &Node| -> graph::Result<Option<u64>> {
+                            Ok(match n {
+                                Node::Var(v) | Node::Blank(v) if row.contains_key(v) => {
+                                    Some(row[v])
                                 }
-                            }),
-                            Node::Blank(_) => None,
-                            Node::Key(k) if insert => Some(g.node_by_key(k.as_bytes())?),
-                            Node::Key(k) => g.find_by_key(k.as_bytes()),
-                            Node::Value(v) if insert => Some(g.value(v.as_bytes())?),
-                            Node::Value(v) => g.find_value(v.as_bytes()),
-                        })
-                    };
-                    // Deleting a link to a constant not in the graph does nothing.
-                    let (Some(s), Some(p), Some(o)) = (id(g, s)?, id(g, p)?, id(g, o)?) else {
-                        continue;
-                    };
-                    if insert {
-                        if g.find_link(s, p, o).is_none() {
-                            g.link(s, p, o)?;
+                                Node::Var(_) => None,
+                                Node::Blank(b) if insert => Some(match blanks.get(b) {
+                                    Some(&id) => id,
+                                    None => {
+                                        let id = g.node()?;
+                                        blanks.insert(b.clone(), id);
+                                        id
+                                    }
+                                }),
+                                Node::Blank(_) => None,
+                                Node::Key(k) if insert => Some(g.node_by_key(k.as_bytes())?),
+                                Node::Key(k) => g.find_by_key(k.as_bytes()),
+                                Node::Value(v) if insert => Some(g.value(v.as_bytes())?),
+                                Node::Value(v) => g.find_value(v.as_bytes()),
+                            })
+                        };
+                        // Deleting a link to a constant not in the graph does nothing.
+                        let (Some(s), Some(p), Some(o)) = (id(g, s)?, id(g, p)?, id(g, o)?) else {
+                            continue;
+                        };
+                        if insert {
+                            if g.find_link(s, p, o).is_none() {
+                                g.link(s, p, o)?;
+                                count += 1;
+                            }
+                        } else if g.delete_link(s, p, o)?.is_some() {
                             count += 1;
                         }
-                    } else if g.delete_link(s, p, o)?.is_some() {
-                        count += 1;
                     }
                 }
+                Ok(if insert {
+                    Output::Inserted(count)
+                } else {
+                    Output::Deleted(count)
+                })
             }
-            Ok(if insert {
-                Output::Inserted(count)
-            } else {
-                Output::Deleted(count)
-            })
         }
     }
 }
 
 /// Parses and runs GraQL statements on `g`, returning each one's output.
+/// Rules defined last only for the rest of `text`; see [`Session`].
 pub fn execute(g: &mut Graph, text: &str) -> Result<Vec<Output>> {
-    parse(text)?.iter().map(|s| run(g, s)).collect()
+    Session::new().execute(g, text)
 }
 
 #[cfg(test)]

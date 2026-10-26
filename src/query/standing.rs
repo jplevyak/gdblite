@@ -81,11 +81,17 @@ fn committed(g: &Graph) -> u64 {
 
 impl StandingQuery {
     /// Evaluates `query` on the committed entries of `g`.  Fails if it has a
-    /// limit, an order or an `as_of`, which a standing query can not keep.
+    /// limit, an order, an `as_of`, paths or calls, which a standing query
+    /// can not keep.
     pub fn new(query: &Query, g: &Graph) -> Result<Self> {
         if query.limit.is_some() || !query.order.is_empty() || query.as_of.is_some() {
             return Err(Error::InvalidArgument(
                 "a standing query can not have a limit, order or as_of",
+            ));
+        }
+        if query.root.has_paths_or_calls() {
+            return Err(Error::InvalidArgument(
+                "a standing query can not have paths or calls",
             ));
         }
         let mut q = query.clone();
@@ -311,7 +317,9 @@ fn fits(p: &Pattern, &(_, spo): &Link) -> bool {
 }
 
 fn run(q: &Query, g: &Graph, overrides: &Overrides) -> Result<Vec<Vec<u64>>> {
-    plan::plan_full(q, g, None, overrides)?.execute(g).collect()
+    plan::plan_full(q, g, None, overrides, None)?
+        .execute(g)
+        .collect()
 }
 
 /// The changes to the selected rows of `q`, which has no `as_of`, for

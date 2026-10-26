@@ -11,7 +11,8 @@ use std::sync::Arc;
 
 use super::plan::{Access, GroupPlan, Join, Plan, Step};
 use super::reduce::{Link, live_links};
-use super::{Filter, Pattern, SortKey, Term, Var};
+use super::rules::{self, Relations, Tuples};
+use super::{Filter, PathPattern, Pattern, SortKey, Term, Var};
 use crate::graph::{Graph, Result};
 use crate::local_table::IdSet;
 use crate::record::Linkage;
@@ -113,6 +114,229 @@ impl Operator for Concat {
                 return Ok(());
             }
             self.ops.remove(0);
+        }
+        Ok(())
+    }
+}
+
+/// Finds the matches of something, given a row.
+trait Lookup {
+    /// Appends to `out` a row extending `row` for each match.
+    fn matches(&mut self, g: &Graph, row: &[u64], out: &mut Batch) -> Result<()>;
+}
+
+/// Extends `row`, binding `bound`, with `values` for `terms`, into `new`:
+/// constants and variables bound or repeated must match.
+fn extend_row(
+    bound: &[bool],
+    row: &[u64],
+    fields: impl IntoIterator<Item = (Term, u64)>,
+    new: &mut Vec<u64>,
+) -> bool {
+    new.clear();
+    new.extend_from_slice(row);
+    let mut set: Vec<Var> = Vec::new();
+    for (term, value) in fields {
+        match term {
+            Term::Id(c) => {
+                if c != value {
+                    return false;
+                }
+            }
+            Term::Var(v) if bound[v.0] || set.contains(&v) => {
+                if new[v.0] != value {
+                    return false;
+                }
+            }
+            Term::Var(v) => {
+                new[v.0] = value;
+                set.push(v);
+            }
+        }
+    }
+    true
+}
+
+/// Finds the pairs a path pattern matches, by searching from whichever end
+/// is bound.
+struct PathLookup {
+    path: PathPattern,
+    bound: Vec<bool>,
+    as_of: Option<u64>,
+    /// The other ends of the live links from (or, if not forward, to) a node
+    /// with a predicate: by predicate, node and direction.
+    neighbors: HashMap<(u64, u64, bool), Arc<Vec<u64>>>,
+}
+
+impl PathLookup {
+    fn value(&self, t: Term, row: &[u64]) -> Option<u64> {
+        match t {
+            Term::Id(id) => Some(id),
+            Term::Var(v) if self.bound[v.0] => Some(row[v.0]),
+            Term::Var(_) => None,
+        }
+    }
+
+    fn neighbors(&mut self, g: &Graph, p: u64, x: u64, forward: bool) -> Arc<Vec<u64>> {
+        let as_of = self.as_of;
+        self.neighbors
+            .entry((p, x, forward))
+            .or_insert_with(|| {
+                let local = g.local();
+                let links = if forward {
+                    tuple_index::find_links_by_intersection(
+                        local,
+                        Intersection::SubjectPredicate,
+                        x,
+                        p,
+                    )
+                } else {
+                    tuple_index::find_links_by_intersection(
+                        local,
+                        Intersection::PredicateObject,
+                        p,
+                        x,
+                    )
+                };
+                let mut ends: Vec<u64> = live_links(g, &links, as_of)
+                    .into_iter()
+                    .filter(|&(_, [s, lp, o])| lp == p && if forward { s == x } else { o == x })
+                    .map(|(_, [s, _, o])| if forward { o } else { s })
+                    .collect();
+                ends.sort_unstable();
+                ends.dedup();
+                Arc::new(ends)
+            })
+            .clone()
+    }
+
+    /// The nodes reachable from `start` by one or more links with `p`.
+    fn reach(&mut self, g: &Graph, p: u64, start: u64, forward: bool) -> Vec<u64> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![start];
+        let mut out = Vec::new();
+        while let Some(x) = stack.pop() {
+            for &y in self.neighbors(g, p, x, forward).iter() {
+                if seen.insert(y) {
+                    out.push(y);
+                    stack.push(y);
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+}
+
+impl Lookup for PathLookup {
+    fn matches(&mut self, g: &Graph, row: &[u64], out: &mut Batch) -> Result<()> {
+        let path = self.path;
+        let [s, pr, o] = path.terms().map(|t| self.value(t, row));
+        let predicates: Vec<u64> = match pr {
+            Some(p) => vec![p],
+            None => {
+                let mut ps: Vec<u64> = g.stats().predicates().map(|(p, _)| p).collect();
+                ps.sort_unstable();
+                ps
+            }
+        };
+        let mut new = Vec::new();
+        let mut emit = |bound: &[bool], s: u64, p: u64, o: u64, out: &mut Batch| {
+            let fields = [(path.subject, s), (path.predicate, p), (path.object, o)];
+            if extend_row(bound, row, fields, &mut new) {
+                out.push(&new);
+            }
+        };
+        let bound = self.bound.clone();
+        for p in predicates {
+            match (s, o) {
+                (Some(s), Some(o)) => {
+                    if self.reach(g, p, s, true).binary_search(&o).is_ok() {
+                        emit(&bound, s, p, o, out);
+                    }
+                }
+                (Some(s), None) => {
+                    for o in self.reach(g, p, s, true) {
+                        emit(&bound, s, p, o, out);
+                    }
+                }
+                (None, Some(o)) => {
+                    for s in self.reach(g, p, o, false) {
+                        emit(&bound, s, p, o, out);
+                    }
+                }
+                (None, None) => {
+                    let links = tuple_index::find_links(g.local(), Linkage::Predicate, p);
+                    let mut subjects: Vec<u64> = live_links(g, &links, self.as_of)
+                        .into_iter()
+                        .filter(|&(_, [_, lp, _])| lp == p)
+                        .map(|(_, [s, _, _])| s)
+                        .collect();
+                    subjects.sort_unstable();
+                    subjects.dedup();
+                    for s in subjects {
+                        for o in self.reach(g, p, s, true) {
+                            emit(&bound, s, p, o, out);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Finds the tuples of a relation matching a call, given a row.
+struct CallLookup {
+    args: Vec<Term>,
+    tuples: Tuples,
+    bound: Vec<bool>,
+    /// The tuples by their values of the arguments known, once built.
+    index: Option<HashMap<Vec<u64>, Vec<usize>>>,
+}
+
+impl Lookup for CallLookup {
+    fn matches(&mut self, _: &Graph, row: &[u64], out: &mut Batch) -> Result<()> {
+        let known: Vec<(usize, Option<u64>)> = self
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(k, t)| match *t {
+                Term::Id(id) => Some((k, Some(id))),
+                Term::Var(v) if self.bound[v.0] => Some((k, None)),
+                Term::Var(_) => None,
+            })
+            .collect();
+        let tuples = &self.tuples;
+        let index = self.index.get_or_insert_with(|| {
+            let mut index: HashMap<Vec<u64>, Vec<usize>> = HashMap::new();
+            for (i, t) in tuples.iter().enumerate() {
+                index
+                    .entry(known.iter().map(|&(k, _)| t[k]).collect())
+                    .or_default()
+                    .push(i);
+            }
+            index
+        });
+        let key: Vec<u64> = known
+            .iter()
+            .map(|&(k, c)| {
+                c.unwrap_or_else(|| match self.args[k] {
+                    Term::Var(v) => row[v.0],
+                    Term::Id(id) => id,
+                })
+            })
+            .collect();
+        let mut new = Vec::new();
+        for &i in index.get(&key).into_iter().flatten() {
+            let fields = self
+                .args
+                .iter()
+                .copied()
+                .zip(self.tuples[i].iter().copied());
+            if extend_row(&self.bound, row, fields, &mut new) {
+                out.push(&new);
+            }
         }
         Ok(())
     }
@@ -238,7 +462,9 @@ impl Matcher {
         });
         index.get(&key_of_row).cloned().unwrap_or_default()
     }
+}
 
+impl Lookup for Matcher {
     /// Appends to `out` a row extending `row` for each live link matching.
     fn matches(&mut self, g: &Graph, row: &[u64], out: &mut Batch) -> Result<()> {
         let live = if self.reduced.is_some() {
@@ -290,7 +516,7 @@ impl Matcher {
 /// Rows extended by each matching link of a pattern, looked up per row.
 struct BindJoin {
     input: Box<dyn Operator>,
-    matcher: Matcher,
+    matcher: Box<dyn Lookup>,
     in_batch: Batch,
     in_pos: usize,
     pending: Batch,
@@ -721,7 +947,7 @@ impl Operator for Limit {
 }
 
 /// What building operators needs to know.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Context {
     /// The slots of a row.
     width: usize,
@@ -729,6 +955,9 @@ struct Context {
     as_of: Option<u64>,
     /// Whether to use the reduction: whether the graph is as it was planned.
     reduced: bool,
+    /// The relations evaluated again, if the graph has changed since
+    /// planned.
+    relations: Option<Arc<Relations>>,
 }
 
 impl Context {
@@ -770,7 +999,7 @@ impl Context {
                     };
                     let scan = |input, bound: &[bool]| BindJoin {
                         input,
-                        matcher: Matcher {
+                        matcher: Box::new(Matcher {
                             pattern: *pattern,
                             access,
                             bound: bound.to_vec(),
@@ -778,7 +1007,7 @@ impl Context {
                             reduced: reduced.clone(),
                             index: None,
                             candidates: candidates.clone(),
-                        },
+                        }),
                         in_batch: Batch::new(width),
                         in_pos: 0,
                         pending: Batch::new(width),
@@ -812,7 +1041,7 @@ impl Context {
                             input: op,
                             branches: branches.clone(),
                             bound: bound.to_vec(),
-                            ctx: *self,
+                            ctx: self.clone(),
                             pending: Batch::new(width),
                             pending_pos: 0,
                         }),
@@ -836,6 +1065,49 @@ impl Context {
                     vars.iter().for_each(|v| bound[v.0] = true);
                     joined
                 }
+                Step::Path { path, .. } => {
+                    let joined = Box::new(BindJoin {
+                        input: op,
+                        matcher: Box::new(PathLookup {
+                            path: *path,
+                            bound: bound.to_vec(),
+                            as_of: path.as_of.or(self.as_of),
+                            neighbors: HashMap::new(),
+                        }),
+                        in_batch: Batch::new(width),
+                        in_pos: 0,
+                        pending: Batch::new(width),
+                        pending_pos: 0,
+                    });
+                    path.vars().for_each(|v| bound[v.0] = true);
+                    joined
+                }
+                Step::Call {
+                    call,
+                    tuples,
+                    given,
+                    ..
+                } => {
+                    let tuples = match &self.relations {
+                        Some(r) if !given => r.tuples[call.relation.0].clone().unwrap_or_default(),
+                        _ => tuples.clone(),
+                    };
+                    let joined = Box::new(BindJoin {
+                        input: op,
+                        matcher: Box::new(CallLookup {
+                            args: call.args.clone(),
+                            tuples,
+                            bound: bound.to_vec(),
+                            index: None,
+                        }),
+                        in_batch: Batch::new(width),
+                        in_pos: 0,
+                        pending: Batch::new(width),
+                        pending_pos: 0,
+                    });
+                    call.vars().for_each(|v| bound[v.0] = true);
+                    joined
+                }
                 Step::Filter(filters) => Box::new(FilterOp {
                     input: op,
                     filters: filters.clone(),
@@ -848,7 +1120,7 @@ impl Context {
                     group: group.clone(),
                     keys: keys.clone(),
                     bound: bound.to_vec(),
-                    ctx: *self,
+                    ctx: self.clone(),
                     once: (*join == Join::Hash).then_some(None),
                 }),
                 Step::NotChange {
@@ -868,7 +1140,7 @@ impl Context {
                     flip_vars: flip_vars.clone(),
                     to_unmatched: *to_unmatched,
                     bound: bound.to_vec(),
-                    ctx: *self,
+                    ctx: self.clone(),
                 }),
             };
         }
@@ -887,6 +1159,8 @@ fn new_vars(vars: impl Iterator<Item = Var>, bound: &[bool]) -> Vec<Var> {
 /// The rows of a query, made by [`Plan::execute`].
 pub struct Rows<'g> {
     g: &'g Graph,
+    /// An error to return first: from evaluating the relations again.
+    error: Option<crate::graph::Error>,
     op: Box<dyn Operator>,
     select: Vec<Var>,
     batch: Batch,
@@ -898,6 +1172,10 @@ impl Iterator for Rows<'_> {
     type Item = Result<Vec<u64>>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(e) = self.error.take() {
+            self.done = true;
+            return Some(Err(e));
+        }
         while self.pos >= self.batch.len() {
             if self.done {
                 return None;
@@ -925,10 +1203,21 @@ impl Plan {
     pub fn execute<'g>(&self, g: &'g Graph) -> Rows<'g> {
         let q = &self.query;
         // A row has a slot even with no variables, so that it is a row.
+        let unchanged = g.next_id() == self.next_id;
+        // Relations evaluated for the graph as it was are evaluated again.
+        let (relations, error) = if unchanged || !q.root.has_paths_or_calls() {
+            (None, None)
+        } else {
+            match rules::evaluate(q, g) {
+                Ok(r) => (Some(Arc::new(r)), None),
+                Err(e) => (None, Some(e)),
+            }
+        };
         let ctx = Context {
             width: q.names.len().max(1),
             as_of: q.as_of,
-            reduced: g.next_id() == self.next_id,
+            reduced: unchanged,
+            relations,
         };
         let mut op = ctx.build(&self.root, unit(ctx.width), &mut vec![false; ctx.width]);
         let select = q.selected();
@@ -956,6 +1245,7 @@ impl Plan {
         }
         Rows {
             g,
+            error,
             op,
             select,
             batch: Batch::new(ctx.width),

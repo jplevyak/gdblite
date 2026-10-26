@@ -53,6 +53,19 @@
 //! - A *filter* may use the variables of its group and of the groups it is
 //!   in.
 //!
+//! # Paths and rules
+//!
+//! A [path](Group::path) pattern matches the subjects and objects joined by
+//! a chain of one or more links with its predicate: the transitive closure,
+//! found by searching from whichever end is bound.
+//!
+//! A [`Relation`] is defined by [`rule`](Query::rule)s, each a head of
+//! variables and a body group, and matched by [`call`](Group::call)s.
+//! Rules may be recursive, through calls to their own relation or others,
+//! but a relation may not depend on its own negation.  The relations a
+//! query calls are evaluated before it runs, semi-naively, and joined from
+//! memory.
+//!
 //! # Planning
 //!
 //! [`Query::plan`] first *reduces* the top group's patterns: by constraint
@@ -108,6 +121,7 @@ use crate::graph::{Error, Graph, Result};
 mod exec;
 mod plan;
 mod reduce;
+mod rules;
 mod standing;
 #[cfg(test)]
 mod tests;
@@ -292,10 +306,60 @@ impl Filter {
     }
 }
 
+/// A pattern matching the pairs of subject and object joined by a chain of
+/// one or more live links with its predicate: its transitive closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PathPattern {
+    pub subject: Term,
+    pub predicate: Term,
+    pub object: Term,
+    /// The id as of which this pattern sees the graph, overriding the
+    /// query's.
+    pub as_of: Option<u64>,
+}
+
+impl PathPattern {
+    fn terms(&self) -> [Term; 3] {
+        [self.subject, self.predicate, self.object]
+    }
+
+    fn vars(&self) -> impl Iterator<Item = Var> + '_ {
+        self.terms().into_iter().filter_map(Term::var)
+    }
+}
+
+/// A relation defined by rules, made by [`Query::relation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Relation(usize);
+
+/// A pattern matching the tuples of a relation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    pub relation: Relation,
+    pub args: Vec<Term>,
+}
+
+impl Call {
+    fn vars(&self) -> impl Iterator<Item = Var> + '_ {
+        self.args.iter().filter_map(|t| t.var())
+    }
+}
+
+/// A rule: the relation holds for the values of `head` in each row of
+/// `body`.
+#[derive(Debug, Clone)]
+struct Rule {
+    relation: Relation,
+    head: Vec<Var>,
+    body: Group,
+}
+
 /// Patterns, unions, negations and filters; see the [module](self) docs.
 #[derive(Debug, Clone, Default)]
 pub struct Group {
     patterns: Vec<Pattern>,
+    paths: Vec<PathPattern>,
+    calls: Vec<Call>,
     unions: Vec<Vec<Group>>,
     nots: Vec<Group>,
     filters: Vec<Filter>,
@@ -364,13 +428,57 @@ impl Group {
         self
     }
 
+    /// Adds a pattern matching the subjects and objects joined by a chain of
+    /// links with `predicate`.
+    pub fn path(
+        &mut self,
+        subject: impl Into<Term>,
+        predicate: impl Into<Term>,
+        object: impl Into<Term>,
+    ) -> &mut Self {
+        self.paths.push(PathPattern {
+            subject: subject.into(),
+            predicate: predicate.into(),
+            object: object.into(),
+            as_of: None,
+        });
+        self
+    }
+
+    /// Adds a pattern matching the tuples of `relation`.
+    pub fn call<T: Into<Term>>(
+        &mut self,
+        relation: Relation,
+        args: impl IntoIterator<Item = T>,
+    ) -> &mut Self {
+        self.calls.push(Call {
+            relation,
+            args: args.into_iter().map(Into::into).collect(),
+        });
+        self
+    }
+
     pub fn patterns(&self) -> &[Pattern] {
         &self.patterns
+    }
+
+    /// The groups directly in this one: union branches and negations.
+    fn groups(&self) -> impl Iterator<Item = &Group> {
+        self.unions.iter().flatten().chain(&self.nots)
+    }
+
+    /// Whether the group, or one in it, has a path or a call.
+    fn has_paths_or_calls(&self) -> bool {
+        !self.paths.is_empty()
+            || !self.calls.is_empty()
+            || self.groups().any(Group::has_paths_or_calls)
     }
 
     /// The variables every row of the group binds.
     fn bound_vars(&self) -> BTreeSet<Var> {
         let mut vars: BTreeSet<Var> = self.patterns.iter().flat_map(Pattern::vars).collect();
+        vars.extend(self.paths.iter().flat_map(PathPattern::vars));
+        vars.extend(self.calls.iter().flat_map(Call::vars));
         for branches in &self.unions {
             if let Some(b) = branches.first() {
                 vars.extend(b.bound_vars());
@@ -391,9 +499,23 @@ impl Group {
 
     /// Checks that the group and those in it have a pattern or union, and
     /// that the branches of each union bind the same variables.
-    fn check(&self) -> Result<()> {
-        if self.patterns.is_empty() && self.unions.is_empty() {
+    fn check(&self, relations: &[(String, usize)]) -> Result<()> {
+        if self.patterns.is_empty()
+            && self.paths.is_empty()
+            && self.calls.is_empty()
+            && self.unions.is_empty()
+        {
             return Err(Error::InvalidArgument("a group needs a pattern or a union"));
+        }
+        for c in &self.calls {
+            if relations
+                .get(c.relation.0)
+                .is_none_or(|r| r.1 != c.args.len())
+            {
+                return Err(Error::InvalidArgument(
+                    "a call has the wrong number of arguments",
+                ));
+            }
         }
         for branches in &self.unions {
             let Some(first) = branches.first() else {
@@ -408,8 +530,8 @@ impl Group {
                 ));
             }
         }
-        for g in self.unions.iter().flatten().chain(&self.nots) {
-            g.check()?;
+        for g in self.groups() {
+            g.check(relations)?;
         }
         Ok(())
     }
@@ -461,11 +583,59 @@ pub struct Query {
     limit: Option<usize>,
     as_of: Option<u64>,
     reduction_budget: Option<u64>,
+    /// The name and arity of each relation.
+    relations: Vec<(String, usize)>,
+    rules: Vec<Rule>,
 }
 
 impl Query {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A new relation of `arity` columns, defined by [`rule`](Self::rule)s;
+    /// `name` is for [`Plan::explain`].
+    pub fn relation(&mut self, name: &str, arity: usize) -> Relation {
+        self.relations.push((name.to_string(), arity));
+        Relation(self.relations.len() - 1)
+    }
+
+    /// Adds a rule: `relation` holds for the values of `head` in each row of
+    /// `body`.  A relation's rules may call it and each other, but not
+    /// within a negation of themselves.
+    pub fn rule(
+        &mut self,
+        relation: Relation,
+        head: impl IntoIterator<Item = Var>,
+        body: Group,
+    ) -> &mut Self {
+        self.rules.push(Rule {
+            relation,
+            head: head.into_iter().collect(),
+            body,
+        });
+        self
+    }
+
+    /// See [`Group::path`].
+    pub fn path(
+        &mut self,
+        subject: impl Into<Term>,
+        predicate: impl Into<Term>,
+        object: impl Into<Term>,
+    ) -> &mut Self {
+        self.root.path(subject, predicate, object);
+        self
+    }
+
+    /// See [`Group::call`].
+    pub fn call<T: Into<Term>>(
+        &mut self,
+        relation: Relation,
+        args: impl IntoIterator<Item = T>,
+    ) -> &mut Self {
+        self.root.call(relation, args);
+        self
     }
 
     /// A new variable; `name` is for [`Plan::explain`].
@@ -593,7 +763,18 @@ impl Query {
     /// Checks the query's groups, and that the variables selected and
     /// ordered by are bound.
     fn check(&self) -> Result<()> {
-        self.root.check()?;
+        self.root.check(&self.relations)?;
+        for rule in &self.rules {
+            rule.body.check(&self.relations)?;
+            let bound = rule.body.bound_vars();
+            if self.relations[rule.relation.0].1 != rule.head.len()
+                || !rule.head.iter().all(|v| bound.contains(v))
+            {
+                return Err(Error::InvalidArgument(
+                    "a rule's head must have its relation's arity and be bound by its body",
+                ));
+            }
+        }
         let bound = self.root.bound_vars();
         let used = self
             .selected()
@@ -635,6 +816,24 @@ impl Query {
             Some(id) => format!("{spo} as of {id}"),
             None => spo,
         }
+    }
+
+    fn path_name(&self, p: &PathPattern) -> String {
+        let spo = format!(
+            "({} {}++ {})",
+            self.term_name(p.subject),
+            self.term_name(p.predicate),
+            self.term_name(p.object)
+        );
+        match p.as_of {
+            Some(id) => format!("{spo} as of {id}"),
+            None => spo,
+        }
+    }
+
+    fn call_name(&self, c: &Call) -> String {
+        let args: Vec<String> = c.args.iter().map(|&t| self.term_name(t)).collect();
+        format!("{}({})", self.relations[c.relation.0].0, args.join(" "))
     }
 
     fn filter_name(&self, f: &Filter) -> String {

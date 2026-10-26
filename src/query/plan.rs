@@ -5,7 +5,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use super::reduce::{self, Link, Reduced, Reduction};
-use super::{Filter, Group, Pattern, Query, Term, Var};
+use super::rules::{self, Relations, Tuples};
+use super::{Call, Filter, Group, PathPattern, Pattern, Query, Term, Var};
 use crate::graph::{Error, Graph, Result};
 use crate::local_table::IdSet;
 use crate::record::Linkage;
@@ -126,6 +127,20 @@ pub(crate) enum Step {
         join: Join,
         rows: f64,
     },
+    /// Joins a path pattern: for each row, a search from whichever of its
+    /// ends is bound.
+    Path {
+        path: PathPattern,
+        rows: f64,
+    },
+    /// Joins a call to a relation, whose tuples are `tuples`: given, if
+    /// `given`, or else the relation's when planned.
+    Call {
+        call: Call,
+        tuples: Tuples,
+        given: bool,
+        rows: f64,
+    },
     Filter(Vec<Filter>),
     /// Removes the rows for which a group has a match, given their values of
     /// `keys`.  The group's plan is for the rows so far, for a bind join, or
@@ -158,6 +173,8 @@ pub(crate) enum Step {
 pub(crate) struct Overrides {
     pub patterns: HashMap<(usize, usize), Vec<Link>>,
     pub nots: HashMap<(usize, usize), NotChange>,
+    /// Calls whose tuples are given.
+    pub calls: HashMap<(usize, usize), Tuples>,
 }
 
 /// A negated group as the graph was and is; see [`Step::NotChange`].
@@ -185,6 +202,8 @@ pub struct Plan {
     pub(crate) root: GroupPlan,
     /// The reduction of the query's top group, if any.
     pub(crate) reduction: Option<Arc<Reduction>>,
+    /// The relations the query calls, as evaluated when planned.
+    pub(crate) relations: Arc<Relations>,
     /// The graph's next id when planned: the reduction is of the graph then.
     pub(crate) next_id: u64,
 }
@@ -205,6 +224,11 @@ impl Plan {
     pub fn explain(&self) -> String {
         let q = &self.query;
         let mut out = String::new();
+        for (i, tuples) in self.relations.tuples.iter().enumerate() {
+            if let Some(t) = tuples {
+                let _ = writeln!(out, "relation {}: {} tuples", q.relations[i].0, t.len());
+            }
+        }
         if let Some(r) = &self.reduction {
             let vars: Vec<String> = r
                 .vars
@@ -295,6 +319,23 @@ fn explain_group(q: &Query, plan: &GroupPlan, depth: usize, alone: bool, out: &m
                     let _ = writeln!(out, "{pad}  branch:");
                     explain_group(q, b, depth + 2, *join == Join::Hash, out);
                 }
+                first = false;
+            }
+            Step::Path { path, rows } => {
+                let how = if first { "scan" } else { "bind join" };
+                let _ = writeln!(out, "{pad}{how} {}, rows ~{rows:.0}", q.path_name(path));
+                first = false;
+            }
+            Step::Call {
+                call, tuples, rows, ..
+            } => {
+                let how = if first { "scan" } else { "bind join" };
+                let _ = writeln!(
+                    out,
+                    "{pad}{how} {} via {} tuples, rows ~{rows:.0}",
+                    q.call_name(call),
+                    tuples.len()
+                );
                 first = false;
             }
             Step::Filter(filters) => {
@@ -472,6 +513,39 @@ impl<'g> Estimator<'g> {
     }
 }
 
+impl Estimator<'_> {
+    /// Estimates a search of `path` with the variables `bound`.
+    fn path_estimate(&self, path: &PathPattern, bound: &[bool]) -> Estimate {
+        let known = |t: Term| match t {
+            Term::Id(_) => true,
+            Term::Var(v) => bound[v.0],
+        };
+        let stats = self.g.stats();
+        let (links, subjects, objects) = match path.predicate {
+            Term::Id(p) => stats.predicate(p).map_or((0.0, 1.0, 1.0), |s| {
+                (
+                    s.live() as f64,
+                    s.subjects.len() as f64,
+                    s.objects.len() as f64,
+                )
+            }),
+            Term::Var(_) => (stats.live() as f64, self.subjects, self.objects),
+        };
+        let fanout = links / subjects.max(1.0);
+        // A guess: a few hops of the fan-out, up to every object.
+        let reach = (fanout * 4.0).clamp(1.0, objects.max(1.0));
+        let matches = match (known(path.subject), known(path.object)) {
+            (true, true) => 0.5,
+            (true, false) | (false, true) => reach,
+            (false, false) => subjects * reach,
+        };
+        Estimate {
+            matches,
+            entries: matches * fanout.max(1.0),
+        }
+    }
+}
+
 fn ratio(a: u64, b: u64) -> f64 {
     if b == 0 { 1.0 } else { a as f64 / b as f64 }
 }
@@ -482,7 +556,31 @@ enum Item<'q> {
     /// A pattern, its reduced links, if it has them, and whether they are
     /// required.
     Pattern(&'q Pattern, Option<&'q Reduced>, bool),
+    Path(&'q PathPattern),
+    /// A call, its tuples, and whether they were given.
+    Call(&'q Call, &'q CallTuples, bool),
     Union(&'q [Group]),
+}
+
+/// The tuples of a call, and the distinct values of each column.
+struct CallTuples {
+    tuples: Tuples,
+    distinct: Vec<usize>,
+}
+
+impl CallTuples {
+    fn new(tuples: Tuples, arity: usize) -> Self {
+        let distinct = (0..arity)
+            .map(|k| {
+                tuples
+                    .iter()
+                    .map(|t| t[k])
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+            })
+            .collect();
+        CallTuples { tuples, distinct }
+    }
 }
 
 /// A partial plan of a group.
@@ -502,6 +600,7 @@ struct Partial {
 struct Planner<'g, 'o> {
     est: Estimator<'g>,
     overrides: &'o Overrides,
+    relations: Arc<Relations>,
     width: usize,
     /// For testing: the join to use wherever it can be.
     force: Option<Join>,
@@ -540,11 +639,34 @@ impl Planner<'_, '_> {
                 None => (reduction.as_ref().and_then(|r| r.links[i].clone()), false),
             })
             .collect();
+        // Each call's tuples: given, or the relation's.
+        let calls: Vec<(CallTuples, bool)> = group
+            .calls
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match self.overrides.calls.get(&(address, i)) {
+                Some(t) => (CallTuples::new(t.clone(), c.args.len()), true),
+                None => {
+                    let t = self.relations.tuples[c.relation.0]
+                        .clone()
+                        .unwrap_or_default();
+                    (CallTuples::new(t, c.args.len()), false)
+                }
+            })
+            .collect();
         let items: Vec<Item> = group
             .patterns
             .iter()
             .zip(&reduced)
             .map(|(p, (r, required))| Item::Pattern(p, r.as_ref(), *required))
+            .chain(group.paths.iter().map(Item::Path))
+            .chain(
+                group
+                    .calls
+                    .iter()
+                    .zip(&calls)
+                    .map(|(c, (t, given))| Item::Call(c, t, *given)),
+            )
             .chain(group.unions.iter().map(|u| Item::Union(u)))
             .collect();
         let candidates = reduction.as_ref().and(self.candidates.clone());
@@ -789,6 +911,42 @@ impl Planner<'_, '_> {
                     ));
                 }
             }
+            Item::Path(path) => {
+                path.vars().for_each(|v| after[v.0] = true);
+                let est = self.est.path_estimate(path, &partial.bound);
+                let rows = partial.rows * est.matches;
+                ways.push((
+                    Step::Path { path: *path, rows },
+                    partial.rows * (LOOKUP_COST + est.entries * ENTRY_COST),
+                    rows,
+                ));
+            }
+            Item::Call(call, t, given) => {
+                call.vars().for_each(|v| after[v.0] = true);
+                let n = t.tuples.len() as f64;
+                let mut matches = n;
+                for (k, arg) in call.args.iter().enumerate() {
+                    let known = match arg {
+                        Term::Id(_) => true,
+                        Term::Var(v) => partial.bound[v.0],
+                    };
+                    if known {
+                        matches /= t.distinct[k].max(1) as f64;
+                    }
+                }
+                let rows = partial.rows * matches;
+                ways.push((
+                    Step::Call {
+                        call: call.clone(),
+                        tuples: t.tuples.clone(),
+                        given,
+                        rows,
+                    },
+                    n * REDUCED_ENTRY_COST
+                        + partial.rows * (REDUCED_LOOKUP_COST + matches * REDUCED_ENTRY_COST),
+                    rows,
+                ));
+            }
             Item::Union(branches) => {
                 let vars: Vec<Var> = branches[0].bound_vars().into_iter().collect();
                 vars.iter().for_each(|v| after[v.0] = true);
@@ -870,17 +1028,24 @@ pub(crate) fn plan(q: &Query, g: &Graph) -> Result<Plan> {
 
 /// Plans `q`, using the join `force` wherever it can be.
 pub(crate) fn plan_with(q: &Query, g: &Graph, force: Option<Join>) -> Result<Plan> {
-    plan_full(q, g, force, &Overrides::default())
+    plan_full(q, g, force, &Overrides::default(), None)
 }
 
-/// Plans `q` with `overrides`, which are by the addresses of `q`'s groups.
+/// Plans `q` with `overrides`, which are by the addresses of `q`'s groups,
+/// and the tuples of the relations it calls, if given (else they are
+/// evaluated).
 pub(crate) fn plan_full(
     q: &Query,
     g: &Graph,
     force: Option<Join>,
     overrides: &Overrides,
+    relations: Option<&Relations>,
 ) -> Result<Plan> {
     q.check()?;
+    let relations = Arc::new(match relations {
+        Some(r) => r.clone(),
+        None => rules::evaluate(q, g)?,
+    });
     let width = q.names.len();
     let root = &q.root as *const Group as usize;
     let budget = q
@@ -897,6 +1062,7 @@ pub(crate) fn plan_full(
     let mut planner = Planner {
         est: Estimator::new(g),
         overrides,
+        relations: relations.clone(),
         width,
         force,
         root,
@@ -913,6 +1079,7 @@ pub(crate) fn plan_full(
         query: q.clone(),
         root,
         reduction,
+        relations,
         next_id: g.next_id(),
     })
 }

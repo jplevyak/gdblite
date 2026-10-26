@@ -270,10 +270,6 @@ fn unsupported() {
         other => panic!("{text}: {other:?}"),
     };
     assert_eq!(
-        unsupported("select ?x where ?x knows++ ?y"),
-        "transitive predicates"
-    );
-    assert_eq!(
         unsupported("select ?x where ?x knows ?y - ; p ?z"),
         "predicate modifiers"
     );
@@ -290,9 +286,13 @@ fn unsupported() {
         unsupported("select ?x where ?x p ?y implies ?x q ?y"),
         "'implies'"
     );
-    assert_eq!(unsupported("select ?x where f(?x)"), "a call");
+    assert_eq!(unsupported("select ?x where f(?x) @ /g"), "'@'");
+    assert_eq!(
+        unsupported("select ?x where /a(?x)"),
+        "a call of a non-rule"
+    );
     assert_eq!(unsupported("select ?x where ?x p list(?a)"), "lists");
-    assert_eq!(unsupported("rule r(?x) ?x p ?y"), "'rule'");
+    assert_eq!(unsupported("function f(?x) ?x"), "'function'");
     assert_eq!(unsupported("insert ?x p ?y into g"), "a named graph");
     assert_eq!(unsupported("select ?x as y where ?x p ?y"), "'as'");
     assert!(matches!(
@@ -316,4 +316,72 @@ fn unsupported() {
         Err(Error::Graph(_))
     ));
     assert!(execute(&mut g, "insert ?x p ?y where ?x q ?z").is_err());
+}
+
+#[test]
+fn paths_and_rules() {
+    let mut g = graph();
+    let mut session = Session::new();
+    session
+        .execute(
+            &mut g,
+            "insert /a parent /b . /b parent /c . /c parent /d . /a age 70 . /b age 40 . /c age 20 . /d age 1",
+        )
+        .unwrap();
+    let sorted_rows = |out: &Output| -> Vec<Vec<u64>> {
+        let mut rows = rows(out).to_vec();
+        rows.sort();
+        rows
+    };
+    let [a, b, c, d] = ["/a", "/b", "/c", "/d"].map(|k| g.find_by_key(k.as_bytes()).unwrap());
+
+    // Transitive predicates.
+    let out = one(&mut g, "select ?x where /a parent++ ?x");
+    assert_eq!(sorted_rows(&out), [[b], [c], [d]]);
+    let out = one(&mut g, "select ?x where ?x parent++ /d ; age ?n . ?n < 50");
+    assert_eq!(sorted_rows(&out), [[b], [c]]);
+    assert_eq!(
+        one(&mut g, "verify /d parent++ /a"),
+        Output::Verified(false)
+    );
+
+    // Rules, in a session: defined, then called, recursively.
+    let out = session
+        .execute(
+            &mut g,
+            "rule ancestor(?x ?y) ?x parent ?y
+             rule ancestor(?x ?y) ?x parent ?z . ancestor(?z ?y)
+             select ?y where ancestor(/b ?y)",
+        )
+        .unwrap();
+    assert_eq!(out[0], Output::Defined("ancestor".into()));
+    assert_eq!(sorted_rows(&out[2]), [[c], [d]]);
+    // Later statements in the session see them; others do not.
+    let out = session
+        .execute(
+            &mut g,
+            "select ?x, ?y where ancestor(?x ?y) . not ?x parent ?y",
+        )
+        .unwrap();
+    assert_eq!(sorted_rows(&out[0]), [[a, c], [a, d], [b, d]]);
+    assert!(matches!(
+        execute(&mut g, "select ?y where ancestor(/b ?y)"),
+        Err(Error::Syntax { .. })
+    ));
+    // Rules using negation of other rules; calls in templates fail.
+    let out = session
+        .execute(
+            &mut g,
+            "rule root(?x) ?x parent ? . not ancestor(? ?x)
+             select ?x where root(?x)",
+        )
+        .unwrap();
+    assert_eq!(sorted_rows(&out[1]), [[a]]);
+    assert!(session.execute(&mut g, "insert ancestor(/d /a)").is_err());
+    // A rule depending on its own negation is not stratified.
+    let err = session.execute(
+        &mut g,
+        "rule odd(?x) ?x parent ? . not odd(?x) select ?x where odd(?x)",
+    );
+    assert!(matches!(err, Err(Error::Graph(_))), "{err:?}");
 }

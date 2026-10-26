@@ -75,7 +75,9 @@ with unions, negation (`not`, like SPARQL's `FILTER NOT EXISTS`), filters,
 query or for each pattern. `plan` orders the patterns and unions by
 estimated cost, from index counts and the graph's statistics, choosing a
 bind join (an index lookup per row) or a hash join for each; `execute`
-streams the rows in batches. Before joining, the planner reduces the top
+streams the rows in batches. Path patterns match transitive closures,
+and rules define recursive relations (Datalog-style, stratified negation),
+evaluated semi-naively. Before joining, the planner reduces the top
 group by constraint propagation, narrowing each variable to candidate ids
 and each pattern to candidate links (within a budget of index entries
 read). `StandingQuery` keeps a query's rows up to date as entries are
@@ -103,10 +105,11 @@ assert_eq!(plan.execute(&g).collect::<Result<Vec<_>, _>>().unwrap(), [[c]]);
 ## GraQL
 
 `graql` parses a Turtle-like query language, after the C++ GraQL grammar, and
-runs it with the query engine: `select`, `verify`, `lookup`, and `insert` /
-`delete` with templates. Patterns use `;`, `,` and `.` as in Turtle, blank
-nodes, `/keys`, `and`, `or`, `not`, and comparisons; the parts of the grammar
-the engine does not support yet (optional and transitive predicates, rules,
+runs it with the query engine: `select`, `verify`, `lookup`, `insert` /
+`delete` with templates, and `rule`s, kept by a `Session`. Patterns use `;`,
+`,` and `.` as in Turtle, blank nodes, `/keys`, `and`, `or`, `not`,
+comparisons, transitive predicates (`p++`) and calls of rules; the parts of
+the grammar the engine does not support yet (optional predicates,
 aggregates, ...) are reported as such.
 
 ```rust
@@ -265,8 +268,8 @@ src/
   stats.rs            per-predicate link statistics for query planning
   query/              pattern queries: types (mod.rs), cost-based planner
                       (plan.rs), reduction by constraint propagation
-                      (reduce.rs), batched operators (exec.rs), standing
-                      queries (standing.rs), tests
+                      (reduce.rs), batched operators (exec.rs), rules
+                      (rules.rs), standing queries (standing.rs), tests
   graph.rs            Graph: the graph database API (tests in graph/)
   graql.rs            GraQL parser and runner (tests in graql/)
 benches/

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use super::plan::{self, Access, Join, Step};
@@ -53,6 +53,8 @@ struct BruteForce<'a> {
     q: &'a Query,
     g: &'a Graph,
     links: HashMap<Option<u64>, Vec<(u64, [u64; 3])>>,
+    /// The tuples of each relation, once evaluated.
+    relations: HashMap<Relation, HashSet<Vec<u64>>>,
 }
 
 type Partial = Vec<Option<u64>>;
@@ -102,6 +104,35 @@ impl BruteForce<'_> {
             }
             rows = next;
         }
+        for path in &group.paths {
+            let links = self.links(path.as_of.or(self.q.as_of));
+            let mut next = Vec::new();
+            for row in &rows {
+                for (s, p, o) in closure(&links) {
+                    let mut new = row.clone();
+                    if bind(
+                        &mut new,
+                        [(path.subject, s), (path.predicate, p), (path.object, o)],
+                    ) {
+                        next.push(new);
+                    }
+                }
+            }
+            rows = next;
+        }
+        for call in &group.calls {
+            let tuples: Vec<Vec<u64>> = self.relations[&call.relation].iter().cloned().collect();
+            let mut next = Vec::new();
+            for row in &rows {
+                for t in &tuples {
+                    let mut new = row.clone();
+                    if bind(&mut new, call.args.iter().copied().zip(t.iter().copied())) {
+                        next.push(new);
+                    }
+                }
+            }
+            rows = next;
+        }
         for branches in &group.unions {
             let mut next = Vec::new();
             for row in &rows {
@@ -119,12 +150,49 @@ impl BruteForce<'_> {
 
     /// The query's rows, selected and made distinct, but not ordered or
     /// limited.
+    /// Evaluates the relations naively, in levels: a relation is above
+    /// those it calls within a negation.
+    fn evaluate(&mut self) {
+        let q = self.q;
+        let n = q.relations.len();
+        let mut level = vec![0usize; n];
+        for _ in 0..=n {
+            for rule in &q.rules {
+                let mut deps = Vec::new();
+                rules_dependencies(&rule.body, false, &mut deps);
+                for (r, negated) in deps {
+                    let l = level[r.0] + usize::from(negated);
+                    level[rule.relation.0] = level[rule.relation.0].max(l);
+                }
+            }
+        }
+        for r in 0..n {
+            self.relations.insert(Relation(r), HashSet::new());
+        }
+        for l in 0..=n {
+            loop {
+                let mut added = false;
+                for rule in q.rules.iter().filter(|r| level[r.relation.0] == l) {
+                    for row in self.group(&rule.body, &vec![None; q.names.len()]) {
+                        let t: Vec<u64> = rule.head.iter().map(|v| row[v.0].unwrap()).collect();
+                        added |= self.relations.get_mut(&rule.relation).unwrap().insert(t);
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+        }
+    }
+
     fn rows(q: &Query, g: &Graph) -> Vec<Vec<u64>> {
         let mut bf = BruteForce {
             q,
             g,
             links: HashMap::new(),
+            relations: HashMap::new(),
         };
+        bf.evaluate();
         let rows = bf.group(&q.root, &vec![None; q.names.len()]);
         let mut out: Vec<Vec<u64>> = rows
             .iter()
@@ -135,6 +203,53 @@ impl BruteForce<'_> {
             out.dedup();
         }
         out
+    }
+}
+
+/// Binds `fields` in `row`: constants and variables already bound must
+/// match.
+fn bind(row: &mut Partial, fields: impl IntoIterator<Item = (Term, u64)>) -> bool {
+    fields.into_iter().all(|(term, value)| match term {
+        Term::Id(c) => c == value,
+        Term::Var(v) => match row[v.0] {
+            Some(bound) => bound == value,
+            None => {
+                row[v.0] = Some(value);
+                true
+            }
+        },
+    })
+}
+
+/// Every (subject, predicate, object) joined by a chain of one or more
+/// links with the predicate, naively.
+fn closure(links: &[(u64, [u64; 3])]) -> BTreeSet<(u64, u64, u64)> {
+    let mut pairs: BTreeSet<(u64, u64, u64)> =
+        links.iter().map(|&(_, [s, p, o])| (s, p, o)).collect();
+    loop {
+        let mut next = pairs.clone();
+        for &(s, p, m) in &pairs {
+            for &(_, [m2, p2, o]) in links {
+                if m2 == m && p2 == p {
+                    next.insert((s, p, o));
+                }
+            }
+        }
+        if next.len() == pairs.len() {
+            return pairs;
+        }
+        pairs = next;
+    }
+}
+
+/// The relations `group` calls, and whether within a negation.
+fn rules_dependencies(group: &Group, negated: bool, out: &mut Vec<(Relation, bool)>) {
+    out.extend(group.calls.iter().map(|c| (c.relation, negated)));
+    for g in group.unions.iter().flatten() {
+        rules_dependencies(g, negated, out);
+    }
+    for g in &group.nots {
+        rules_dependencies(g, true, out);
     }
 }
 
@@ -258,6 +373,10 @@ impl Generator<'_> {
         let s = self.term(q, vars, nodes, 70);
         let p = self.term(q, vars, predicates, 15);
         let o = self.term(q, vars, nodes, 70);
+        if self.rng.chance(10) {
+            group.path(s, p, o);
+            return;
+        }
         group.pattern(s, p, o);
         if self.rng.chance(10) {
             group.patterns.last_mut().unwrap().link = Some(q.var("link"));
@@ -265,6 +384,51 @@ impl Generator<'_> {
         if self.rng.chance(10) {
             let (start, end) = self.ids;
             group.at(start + self.rng.next() % (end - start));
+        }
+    }
+
+    /// Random recursive rules, and a call to them in `root`.
+    fn rules(&mut self, q: &mut Query, root: &mut Group, vars: &mut Vec<Var>) {
+        let (nodes, predicates) = (self.nodes, self.predicates);
+        let r = q.relation("r", 2);
+        let s = q.relation("s", 2);
+        let (a, b, c) = (q.var("a"), q.var("b"), q.var("c"));
+        let mut base = Group::new();
+        base.pattern(a, self.rng.pick(predicates), b);
+        q.rule(r, [a, b], base);
+        // Recursion to the left, to the right, or both, possibly through s.
+        let mut step = Group::new();
+        match self.rng.below(3) {
+            0 => step
+                .call(r, [a, c])
+                .pattern(c, self.rng.pick(predicates), b),
+            1 => step
+                .pattern(a, self.rng.pick(predicates), c)
+                .call(r, [c, b]),
+            _ => step.call(r, [a, c]).call(r, [c, b]),
+        };
+        if self.rng.chance(40) {
+            q.rule(s, [a, b], step);
+            let mut via = Group::new();
+            via.call(s, [a, b]);
+            q.rule(r, [a, b], via);
+        } else {
+            q.rule(r, [a, b], step);
+        }
+        // A relation defined by a negation of r.
+        let t = q.relation("t", 1);
+        let mut unreached = Group::new();
+        let mut reached = Group::new();
+        reached.call(r, [Term::Id(self.rng.pick(nodes)), a.into()]);
+        unreached
+            .pattern(a, self.rng.pick(predicates), b)
+            .not(reached);
+        q.rule(t, [a], unreached);
+        let x = self.term(q, vars, nodes, 80);
+        let y = self.term(q, vars, nodes, 90);
+        root.call(if self.rng.chance(70) { r } else { s }, [x, y]);
+        if self.rng.chance(30) {
+            root.call(t, [y]);
         }
     }
 
@@ -344,6 +508,9 @@ impl Generator<'_> {
                 .map(|_| self.branch(&mut q, &union_vars))
                 .collect::<Vec<_>>();
             root.union(branches);
+        }
+        if self.rng.chance(20) {
+            self.rules(&mut q, &mut root, &mut vars);
         }
         if self.rng.chance(30) {
             let bound: Vec<Var> = root.bound_vars().into_iter().collect();
@@ -965,6 +1132,10 @@ fn standing_queries() {
             q.limit = None;
             q.order.clear();
             q.as_of = None;
+            if q.root.has_paths_or_calls() {
+                assert!(StandingQuery::new(&q, &g).is_err());
+                continue;
+            }
             let mut standing = StandingQuery::new(&q, &g).unwrap();
             assert_eq!(standing.rows(), committed_rows(&q, &g, standing.at()));
             for _ in 0..4 {
@@ -1076,4 +1247,168 @@ fn standing_query_changes() {
     let mut q2 = q.clone();
     q2.as_of(1);
     assert!(StandingQuery::new(&q2, &g).is_err());
+}
+
+/// A graph of `n` nodes with `knows` from each to the next, a cycle back
+/// from the last to `back`, and `likes` from the first to the last.
+fn chain(n: usize, back: usize) -> (Graph, Vec<u64>, u64, u64) {
+    let mut g = graph();
+    let (knows, likes) = (g.value(b"knows").unwrap(), g.value(b"likes").unwrap());
+    let nodes: Vec<u64> = (0..n).map(|_| g.node().unwrap()).collect();
+    for w in nodes.windows(2) {
+        g.link(w[0], knows, w[1]).unwrap();
+    }
+    g.link(nodes[n - 1], knows, nodes[back]).unwrap();
+    g.link(nodes[0], likes, nodes[n - 1]).unwrap();
+    (g, nodes, knows, likes)
+}
+
+#[test]
+fn paths() {
+    let (g, n, knows, likes) = chain(5, 2);
+    let ids = |rows: Vec<Vec<u64>>| sorted(rows);
+    // From a bound subject: everyone reachable, including the cycle.
+    let mut q = Query::new();
+    let y = q.var("y");
+    q.path(n[0], knows, y);
+    assert_eq!(
+        ids(q.run(&g).unwrap()),
+        ids(n[1..].iter().map(|&x| vec![x]).collect())
+    );
+    check(&q, &g);
+    // To a bound object: everyone who reaches it.
+    let mut q = Query::new();
+    let x = q.var("x");
+    q.path(x, knows, n[1]);
+    assert_eq!(q.run(&g).unwrap(), [[n[0]]]);
+    check(&q, &g);
+    // Both bound, and a node reaching itself only through the cycle.
+    let mut q = Query::new();
+    q.path(n[3], knows, n[2]);
+    assert_eq!(q.run(&g).unwrap().len(), 1);
+    let mut q = Query::new();
+    let x = q.var("x");
+    q.path(x, knows, x);
+    assert_eq!(ids(q.run(&g).unwrap()), [[n[2]], [n[3]], [n[4]]]);
+    check(&q, &g);
+    // Neither bound, with a variable predicate, and joined to a pattern.
+    let mut q = Query::new();
+    let (x, p, y) = (q.var("x"), q.var("p"), q.var("y"));
+    q.path(x, p, y);
+    // n[0] reaches 4 nodes and the others 3 each, and one likes link.
+    assert_eq!(q.run(&g).unwrap().len(), 4 + 4 * 3 + 1);
+    check(&q, &g);
+    let mut q = Query::new();
+    let (x, y) = (q.var("x"), q.var("y"));
+    q.pattern(x, likes, y).path(y, knows, x);
+    assert!(q.run(&g).unwrap().is_empty());
+    q.root.patterns[0].object = Term::Id(n[4]);
+    let plan = q.plan(&g).unwrap();
+    assert!(
+        plan.explain().contains("++ ?x), rows"),
+        "{}",
+        plan.explain()
+    );
+    check(&q, &g);
+    // In a negation: who can not reach n[1]?
+    let mut q = Query::new();
+    let (x, z) = (q.var("x"), q.var("z"));
+    let mut reaches = Group::new();
+    reaches.path(x, knows, n[1]);
+    q.pattern(x, knows, z).not(reaches).select([x]);
+    assert_eq!(ids(q.run(&g).unwrap()), [[n[1]], [n[2]], [n[3]], [n[4]]]);
+    check(&q, &g);
+}
+
+#[test]
+fn rules() {
+    let (mut g, n, knows, likes) = chain(5, 2);
+    let mut q = Query::new();
+    let reach = q.relation("reach", 2);
+    let (a, b, c) = (q.var("a"), q.var("b"), q.var("c"));
+    let mut base = Group::new();
+    base.pattern(a, knows, b);
+    let mut step = Group::new();
+    step.call(reach, [a, c]).pattern(c, knows, b);
+    q.rule(reach, [a, b], base).rule(reach, [a, b], step);
+    let (x, y) = (q.var("x"), q.var("y"));
+    q.call(reach, [x, y]);
+    // The same as the transitive path.
+    let mut p = Query::new();
+    let (x2, y2) = (p.var("x"), p.var("y"));
+    p.path(x2, knows, y2);
+    assert_eq!(sorted(q.run(&g).unwrap()), sorted(p.run(&g).unwrap()));
+    let plan = q.plan(&g).unwrap();
+    assert!(
+        plan.explain().starts_with("relation reach: 16 tuples"),
+        "{}",
+        plan.explain()
+    );
+    check(&q, &g);
+
+    // Mutual recursion: nodes an even and odd number of steps away.
+    let mut q = Query::new();
+    let (even, odd) = (q.relation("even", 1), q.relation("odd", 1));
+    let (a, b) = (q.var("a"), q.var("b"));
+    let mut zero = Group::new();
+    zero.pattern(a, likes, b);
+    q.rule(even, [a], zero);
+    let mut from_even = Group::new();
+    from_even.call(even, [b]).pattern(b, knows, a);
+    q.rule(odd, [a], from_even);
+    let mut from_odd = Group::new();
+    from_odd.call(odd, [b]).pattern(b, knows, a);
+    q.rule(even, [a], from_odd);
+    let x = q.var("x");
+    q.call(even, [x]).call(odd, [x]);
+    // n[0] is even; on the cycle n[2] n[3] n[4] (odd length) both are.
+    assert_eq!(sorted(q.run(&g).unwrap()), [[n[2]], [n[3]], [n[4]]]);
+    check(&q, &g);
+
+    // Stratified negation: nodes no path from n[3] reaches.
+    let mut q = Query::new();
+    let (reach, far) = (q.relation("reach", 1), q.relation("far", 1));
+    let (a, b) = (q.var("a"), q.var("b"));
+    let mut base = Group::new();
+    base.pattern(n[3], knows, a);
+    let mut step = Group::new();
+    step.call(reach, [b]).pattern(b, knows, a);
+    q.rule(reach, [a], base).rule(reach, [a], step);
+    let mut unreached = Group::new();
+    let mut reached = Group::new();
+    reached.call(reach, [a]);
+    unreached.pattern(a, knows, b).not(reached);
+    q.rule(far, [a], unreached);
+    let x = q.var("x");
+    q.call(far, [x]);
+    assert_eq!(sorted(q.run(&g).unwrap()), [[n[0]], [n[1]]]);
+    check(&q, &g);
+
+    // A plan made before the graph changed evaluates its rules again.
+    let plan = q.plan(&g).unwrap();
+    g.link(n[4], knows, n[0]).unwrap();
+    assert!(plan.execute(&g).next().is_none());
+
+    // Errors.
+    let mut q = Query::new();
+    let r = q.relation("r", 1);
+    let a = q.var("a");
+    let mut not_r = Group::new();
+    let mut body = Group::new();
+    not_r.call(r, [a]);
+    body.pattern(a, knows, n[0]).not(not_r);
+    q.rule(r, [a], body).call(r, [a]);
+    assert!(matches!(q.plan(&g), Err(Error::InvalidArgument(_))));
+    let mut q = Query::new();
+    let r = q.relation("r", 2);
+    let a = q.var("a");
+    q.call(r, [a]);
+    assert!(matches!(q.plan(&g), Err(Error::InvalidArgument(_))));
+    let mut q = Query::new();
+    let r = q.relation("r", 1);
+    let (a, b) = (q.var("a"), q.var("b"));
+    let mut body = Group::new();
+    body.pattern(a, knows, n[0]);
+    q.rule(r, [b], body).call(r, [a]);
+    assert!(matches!(q.plan(&g), Err(Error::InvalidArgument(_))));
 }
