@@ -19,6 +19,8 @@ pub mod local_record_log;
 pub mod local_table;
 #[cfg(all(unix, target_pointer_width = "64"))]
 mod mmap;
+#[cfg(all(unix, target_pointer_width = "64"))]
+pub mod query;
 pub mod record;
 pub mod record_log;
 #[cfg(all(unix, target_pointer_width = "64"))]

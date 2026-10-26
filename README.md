@@ -67,6 +67,32 @@ deleting its other live values. `node_by_key` finds or creates the node with a
 unique key. `import` loads entries numbered elsewhere, mapping their ids to
 local ones.
 
+## Queries
+
+`query::Query` matches triple patterns over variables against the live links,
+with filters, a selection, a limit and `as_of`. `plan` orders the patterns
+by estimated cost, from index counts and the graph's statistics, choosing a
+bind join (an index lookup per row) or a hash join for each; `execute`
+streams the rows in batches.
+
+```rust
+use gdblite::graph::{Graph, Options};
+use gdblite::query::Query;
+
+let mut g = Graph::open(None, Options::default()).unwrap();
+let knows = g.value(b"knows").unwrap();
+let (a, b, c) = (g.node().unwrap(), g.node().unwrap(), g.node().unwrap());
+g.link(a, knows, b).unwrap();
+g.link(b, knows, c).unwrap();
+
+let mut q = Query::new();
+let (x, y) = (q.var("x"), q.var("y"));
+q.pattern(a, knows, x).pattern(x, knows, y).select([y]);
+let plan = q.plan(&g).unwrap();
+println!("{}", plan.explain());
+assert_eq!(plan.execute(&g).collect::<Result<Vec<_>, _>>().unwrap(), [[c]]);
+```
+
 ## Record log usage
 
 ```rust
@@ -209,6 +235,8 @@ src/
   tuple_index.rs      built-in graph indexes: links by linkage, values, SPO,
                       intersections (tests in tuple_index/)
   stats.rs            per-predicate link statistics for query planning
+  query/              pattern queries: types (mod.rs), cost-based planner
+                      (plan.rs), batched operators (exec.rs), tests
   graph.rs            Graph: the graph database API (tests in graph/)
 benches/
   record_log.rs       encode/decode benchmarks
