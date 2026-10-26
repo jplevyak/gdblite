@@ -31,10 +31,6 @@ fn set(ids: &[u64]) -> IdSet {
     ids.iter().copied().collect()
 }
 
-fn no_compounds(_: u64) -> Option<Linkage> {
-    None
-}
-
 /// Appends a link, returning its id.
 fn link(local: &mut Local, fields: LinkFields) -> u64 {
     let r = Record::link(local.log().next_id(), &fields).unwrap();
@@ -45,24 +41,44 @@ fn link(local: &mut Local, fields: LinkFields) -> u64 {
 #[test]
 fn duplicate_value() {
     let mut local = Local::open(None, Options::default()).unwrap();
-    let records = [Record::value(1, b"foo"), Record::value(2, b"foo")];
-    let err = index_records(&mut local, &records, no_compounds);
+    let log = local.log_mut();
+    let (a, b, c) = (
+        log.push_value(b"foo").unwrap(),
+        log.push_value(b"foo").unwrap(),
+        log.push_value(b"foo").unwrap(),
+    );
+    let records: Vec<_> = [a, b, c]
+        .iter()
+        .map(|&id| local.log().get(id).unwrap().into_owned())
+        .collect();
+    let err = index_records(&mut local, &records);
     assert!(matches!(
         err,
-        Err(Error::DuplicateValue { id: 2, existing: 1 })
+        Err(Error::DuplicateValue { id, existing }) if (id, existing) == (b, a)
     ));
     // Nothing was indexed.
     assert_eq!(find_value(&local, b"foo"), None);
 
-    index_records(&mut local, &records[..1], no_compounds).unwrap();
-    assert_eq!(find_value(&local, b"foo"), Some(1));
+    index_records(&mut local, &records[..1]).unwrap();
+    assert_eq!(find_value(&local, b"foo"), Some(a));
     // Indexing the same value again is fine; a new one with its data is not.
-    index_records(&mut local, &records[..1], no_compounds).unwrap();
-    let err = index_records(&mut local, &[Record::value(9, b"foo")], no_compounds);
+    index_records(&mut local, &records[..1]).unwrap();
+    let err = index_records(&mut local, &records[2..]);
     assert!(matches!(
         err,
-        Err(Error::DuplicateValue { id: 9, existing: 1 })
+        Err(Error::DuplicateValue { id, existing }) if (id, existing) == (c, a)
     ));
+
+    // An entry that no longer names a value, as after a crash, is replaced.
+    let node = local.log_mut().push_node().unwrap();
+    local
+        .table_mut(BuiltinIndex::Value.table())
+        .set(Uuid::of(b"bar"), node)
+        .unwrap();
+    let bar = local.log_mut().push_value(b"bar").unwrap();
+    let record = local.log().get(bar).unwrap().into_owned();
+    index_records(&mut local, &[record]).unwrap();
+    assert_eq!(find_value(&local, b"bar"), Some(bar));
 }
 
 /// The ids of a small graph.
@@ -168,7 +184,7 @@ fn graph() {
     let mut local = Local::open(None, Options::default()).unwrap();
     let start = local.log().start_id();
     let g = build(&mut local);
-    index_log(&mut local, start, no_compounds).unwrap();
+    index_log(&mut local, start).unwrap();
     check(&local, &g);
 }
 
@@ -181,7 +197,7 @@ fn records_from_elsewhere() {
         .records(local.log().start_id())
         .map(|r| r.unwrap().into_owned())
         .collect();
-    index_records(&mut local, &records, no_compounds).unwrap();
+    index_records(&mut local, &records).unwrap();
     check(&local, &g);
 }
 
@@ -193,7 +209,7 @@ fn persistent() {
         let mut local = Local::open(Some(&prefix), Options::default()).unwrap();
         let start = local.log().start_id();
         let g = build(&mut local);
-        index_log(&mut local, start, no_compounds).unwrap();
+        index_log(&mut local, start).unwrap();
         local.commit().unwrap();
         g
     };
@@ -202,46 +218,6 @@ fn persistent() {
     check(&local, &g);
     drop(local);
     local::remove(&prefix).unwrap();
-}
-
-#[test]
-fn compounds() {
-    let mut local = Local::open(None, Options::default()).unwrap();
-    let mut value = |data: &str| local.log_mut().push_value(data.as_bytes()).unwrap();
-    let (street, city) = (value("street"), value("city"));
-    let (main, elm, springfield) = (value("Main St"), value("Elm St"), value("Springfield"));
-    let (home, work) = (
-        local.log_mut().push_node().unwrap(),
-        local.log_mut().push_node().unwrap(),
-    );
-    let start = local.log().start_id();
-    for (hub, predicate, object) in [
-        (home, street, main),
-        (home, city, springfield),
-        (work, street, elm),
-        (work, city, springfield),
-    ] {
-        link(
-            &mut local,
-            LinkFields {
-                subject: hub,
-                predicate,
-                object,
-                ..LinkFields::default()
-            },
-        );
-    }
-    let hub_linkage = |p| (p == street || p == city).then_some(Linkage::Subject);
-    index_log(&mut local, start, hub_linkage).unwrap();
-    assert_eq!(
-        find_hub(&local, &[(street, main), (city, springfield)]),
-        Some(home)
-    );
-    assert_eq!(
-        find_hub(&local, &[(city, springfield), (street, elm)]),
-        Some(work)
-    );
-    assert_eq!(find_hub(&local, &[(city, springfield)]), None);
 }
 
 #[test]
@@ -261,15 +237,6 @@ fn keys() {
     assert_ne!(big, spo_key(u64::MAX, u64::MAX >> 1, 1 << 61));
     // Every key can be a table key.
     assert_ne!(spo_key(0, 0, 0).uuid0, 0);
-    assert_ne!(cspo_key(&[]).uuid0, 0);
-
-    assert_eq!(cspo_key(&[(1, 2), (3, 4)]), cspo_key(&[(3, 4), (1, 2)]));
-    assert_ne!(cspo_key(&[(1, 2), (3, 4)]), cspo_key(&[(1, 4), (3, 2)]));
-    let many: Vec<(u64, u64)> = (1..100).map(|i| (i, i * 1000)).collect();
-    assert_eq!(
-        cspo_key(&many),
-        cspo_key(&many.iter().rev().copied().collect::<Vec<_>>())
-    );
 
     assert_eq!(intersection_key(5, 6), Uuid { uuid0: 5, uuid1: 6 });
     assert_eq!(Intersection::of(Linkage::Object, Linkage::Subject), None);

@@ -10,9 +10,9 @@ to the tuple's own position so that nearby references take only a byte or two.
 A persistent **dynamic table** (an on-disk hash table) maps 64 or 128 bit keys
 to lists of `u64` values, for use as an index.
 
-> **Status:** early development. The storage layer (record log, dynamic table,
-> and a local database combining a file-backed log with index tables) is in
-> place; the graph query layer is still to come.
+> **Status:** early development. The storage layer and a graph API (interned
+> values, links with delete and history, index-backed queries) are in place;
+> a query language is still to come.
 
 ## Data model
 
@@ -29,7 +29,40 @@ no separate index to resolve.
 By convention the fifth field of a tuple (index 4, `record_log::WHEN_FIELD`)
 holds a timestamp.
 
-## Usage
+## Graph
+
+`graph::Graph` is the database: nodes, interned values, and links of
+subject, predicate and object (plus author, creation time and subgraphs),
+stored in memory mapped files and indexed by each of those.
+
+```rust
+use gdblite::graph::{Graph, Options};
+use gdblite::Linkage;
+
+// Pass Some(path_prefix) for a graph on disk, or None for one in memory.
+let mut g = Graph::open(None, Options::default()).unwrap();
+let knows = g.value(b"knows").unwrap();        // values are interned
+let (alice, bob) = (g.node().unwrap(), g.node().unwrap());
+let link = g.link(alice, knows, bob).unwrap();
+assert_eq!(g.link(alice, knows, bob).unwrap(), link);  // already live
+g.commit().unwrap();
+
+assert_eq!(g.follow_forward(knows, [alice]), [bob].into());
+assert_eq!(g.find_link(alice, knows, bob), Some(link));
+
+// Deleting appends a dead link; the history stays queryable by id (time).
+g.delete_link(alice, knows, bob).unwrap();
+assert!(g.follow_forward(knows, [alice]).is_empty());
+let all = g.links_at(Linkage::Subject, [alice]);
+assert_eq!(g.live(&all, Some(link)), [link].into());
+```
+
+A link is identified by its subject, predicate and object, and the latest link
+with them says whether it is live or dead. Ids increase as entries are
+appended, so queries taking `as_of` see the graph as of that id. Appends are
+visible at once and durable on `commit`; `batch` appends all or nothing.
+
+## Record log usage
 
 ```rust
 use gdblite::RecordLog;
@@ -169,7 +202,8 @@ src/
   local_table.rs      index from ids or uuids to id sets, on a dynamic table
   local.rs            local database: a log plus index tables (tests in local/)
   tuple_index.rs      built-in graph indexes: links by linkage, values, SPO,
-                      intersections, compounds (tests in tuple_index/)
+                      intersections (tests in tuple_index/)
+  graph.rs            Graph: the graph database API (tests in graph/)
 benches/
   record_log.rs       encode/decode benchmarks
 reference/            original C++ sources ported to Rust

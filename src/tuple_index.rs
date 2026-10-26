@@ -1,19 +1,16 @@
 //! The built-in indexes of a graph: links by each linkage, values by content,
-//! links by (subject, predicate, object), links by pairs of linkages, and
-//! compound hubs by their spokes.
+//! links by (subject, predicate, object), and links by pairs of linkages.
 //!
-//! Ported from the C++ `Indexes`.  Each [`BuiltinIndex`] is the
-//! [`Local`] table of the same number.
-//!
-//! The compound index needs the schema: which predicates are the spokes of a
-//! compound, and which linkage of such a link is the hub.  The caller supplies
-//! that as a function from a predicate to its hub linkage.  As in the C++, a
-//! hub's key is made from the spokes in one batch of records, so a compound's
-//! links should be indexed together.
+//! Ported from the C++ `Indexes`, without its schema-specific compound index.
+//! Each [`BuiltinIndex`] is the [`Local`] table of the same number.
 //!
 //! Fixed from the C++: every subgraph of a link is indexed, not just the
 //! first; a duplicate value is an error rather than a crash; and finding by
 //! intersection gives the latest link both in memory and on disk.
+//!
+//! After a crash an index may name ids that are now filler nodes (see
+//! [`local`](crate::local)); callers should check what the ids they find
+//! name.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -45,12 +42,10 @@ pub enum BuiltinIndex {
     SubjectPredicate,
     /// Links by [`intersection_key`] of predicate and object.
     PredicateObject,
-    /// Each compound hub by the [`cspo_key`] of its spokes.
-    Compound,
 }
 
 /// The number of built-in indexes.
-pub const NUM_BUILTIN_INDEXES: usize = 10;
+pub const NUM_BUILTIN_INDEXES: usize = 9;
 
 impl BuiltinIndex {
     /// The table number.
@@ -71,7 +66,7 @@ impl BuiltinIndex {
     }
 }
 
-const _: () = assert!(BuiltinIndex::Compound as usize + 1 == NUM_BUILTIN_INDEXES);
+const _: () = assert!(BuiltinIndex::PredicateObject as usize + 1 == NUM_BUILTIN_INDEXES);
 
 /// The indexes of links by a pair of linkages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,8 +98,8 @@ impl Intersection {
 pub enum Error {
     Index(dynamic_table::Error),
     Log(local_record_log::Error),
-    /// A value's data is already the value at `existing`; values are
-    /// interned, so each distinct data may appear once.
+    /// A value's data is already the value at `existing` (or has the same
+    /// uuid); values are interned, so each distinct data may appear once.
     DuplicateValue {
         id: u64,
         existing: u64,
@@ -182,19 +177,6 @@ pub fn spo_key(subject: u64, predicate: u64, object: u64) -> Uuid {
     small_uuid(&b)
 }
 
-/// The key of a compound's spokes, each a (predicate, non-hub node) pair, in
-/// any order.
-pub fn cspo_key(spokes: &[(u64, u64)]) -> Uuid {
-    let mut spokes = spokes.to_vec();
-    spokes.sort_unstable();
-    let mut b = Vec::with_capacity(20 * spokes.len());
-    for (predicate, node) in spokes {
-        put_varint(&mut b, predicate);
-        put_varint(&mut b, node);
-    }
-    small_uuid(&b)
-}
-
 /// The key of a pair of linkages.
 pub fn intersection_key(x: u64, y: u64) -> Uuid {
     Uuid { uuid0: x, uuid1: y }
@@ -206,8 +188,6 @@ struct Updates {
     values: Vec<(Uuid, u64)>,
     /// Ids to add to sets, by index and key.
     sets: BTreeMap<(usize, Uuid), Vec<u64>>,
-    /// Compound hubs, with their spokes.
-    hubs: BTreeMap<u64, Vec<(u64, u64)>>,
 }
 
 impl Updates {
@@ -215,7 +195,7 @@ impl Updates {
         self.sets.entry((index.table(), key)).or_default().push(id);
     }
 
-    fn record(&mut self, r: &Record<'_>, hub_linkage: &impl Fn(u64) -> Option<Linkage>) {
+    fn record(&mut self, r: &Record<'_>) {
         if r.is_value() {
             let data = r.data().expect("a value");
             self.values.push((Uuid::of(data), r.id()));
@@ -239,23 +219,19 @@ impl Updates {
         if p != 0 {
             self.add(BuiltinIndex::PredicateObject, intersection_key(p, o), id);
         }
-        if let Some(hub) = hub_linkage(p)
-            && let Some(spoke) = hub.inverse()
-        {
-            self.hubs
-                .entry(link.get(hub))
-                .or_default()
-                .push((p, link.get(spoke)));
-        }
     }
 
     fn apply(self, local: &mut Local) -> Result<()> {
-        // Check every value before writing anything.
+        // Check every value before writing anything.  An existing entry that
+        // no longer names a value is left from a crash and is replaced.
         let values = local.table(BuiltinIndex::Value.table());
         let mut seen = HashMap::new();
         for &(uuid, id) in &self.values {
             let existing = *seen.entry(uuid).or_insert(id);
-            let existing = values.find_one(uuid).unwrap_or(existing);
+            let existing = values
+                .find_one(uuid)
+                .filter(|&e| local.log().get(e).is_ok_and(|r| r.is_value()))
+                .unwrap_or(existing);
             if existing != id {
                 return Err(Error::DuplicateValue { id, existing });
             }
@@ -266,42 +242,26 @@ impl Updates {
         for ((table, key), ids) in self.sets {
             local.table_mut(table).insert(key, ids)?;
         }
-        // After the others, as in the C++, where the schema was read from
-        // them.
-        for (hub, spokes) in self.hubs {
-            local
-                .table_mut(BuiltinIndex::Compound.table())
-                .set(cspo_key(&spokes), hub)?;
-        }
         Ok(())
     }
 }
 
-/// Indexes `records`.  `hub_linkage` gives the hub linkage of each predicate
-/// that is a spoke of a compound.  Fails without indexing anything if a value
+/// Indexes `records`.  Fails without indexing anything if a value
 /// duplicates another.
-pub fn index_records(
-    local: &mut Local,
-    records: &[Record<'_>],
-    hub_linkage: impl Fn(u64) -> Option<Linkage>,
-) -> Result<()> {
+pub fn index_records(local: &mut Local, records: &[Record<'_>]) -> Result<()> {
     let mut updates = Updates::default();
     for r in records {
-        updates.record(r, &hub_linkage);
+        updates.record(r);
     }
     updates.apply(local)
 }
 
 /// Indexes the log's entries from `start` (which must start an entry) to the
 /// end; see [`index_records`].
-pub fn index_log(
-    local: &mut Local,
-    start: u64,
-    hub_linkage: impl Fn(u64) -> Option<Linkage>,
-) -> Result<()> {
+pub fn index_log(local: &mut Local, start: u64) -> Result<()> {
     let mut updates = Updates::default();
     for r in local.log().records(start) {
-        updates.record(&r?, &hub_linkage);
+        updates.record(&r?);
     }
     updates.apply(local)
 }
@@ -359,14 +319,6 @@ pub fn find_link_by_intersection(
     find_links_by_intersection(local, intersection, x, y)
         .last()
         .copied()
-}
-
-/// The hub of the compound with `spokes`, each a (predicate, non-hub node)
-/// pair.
-pub fn find_hub(local: &Local, spokes: &[(u64, u64)]) -> Option<u64> {
-    local
-        .table(BuiltinIndex::Compound.table())
-        .find_one(cspo_key(spokes))
 }
 
 #[cfg(test)]

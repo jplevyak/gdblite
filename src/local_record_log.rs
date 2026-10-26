@@ -56,7 +56,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::mmap::{self, Mapping, round_up_to_page, suffixed};
 use crate::record::{Record, Uuid};
 use crate::record_log::{
-    HEADER_SIZE, PersistentHeader, encode_tuple, encode_value, max_tuple_len, max_value_len,
+    Entry, HEADER_SIZE, PersistentHeader, encode_tuple, encode_value, max_tuple_len, max_value_len,
 };
 
 /// The most data files a log may have.
@@ -585,6 +585,12 @@ impl LocalRecordLog {
             f.map
                 .bytes(HEADER + (id - f.start_id), self.file_end(i) - id)
         })
+    }
+
+    /// The entry at `id`, borrowed from the log.
+    pub fn entry(&self, id: u64) -> Result<Entry<'_>> {
+        let bytes = self.bytes_from(id).ok_or(crate::Error::IdOutOfRange)?;
+        Ok(Entry::parse(bytes)?)
     }
 
     /// The entry at `id`.

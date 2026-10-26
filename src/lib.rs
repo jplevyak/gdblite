@@ -10,6 +10,8 @@ pub mod coder;
 pub mod dynamic_table;
 mod error;
 #[cfg(all(unix, target_pointer_width = "64"))]
+pub mod graph;
+#[cfg(all(unix, target_pointer_width = "64"))]
 pub mod local;
 #[cfg(all(unix, target_pointer_width = "64"))]
 pub mod local_record_log;
