@@ -208,6 +208,7 @@ src/
   local.rs            local database: a log plus index tables (tests in local/)
   tuple_index.rs      built-in graph indexes: links by linkage, values, SPO,
                       intersections (tests in tuple_index/)
+  stats.rs            per-predicate link statistics for query planning
   graph.rs            Graph: the graph database API (tests in graph/)
 benches/
   record_log.rs       encode/decode benchmarks

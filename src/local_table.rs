@@ -48,6 +48,15 @@ fn to_set(lookup: Option<Lookup>) -> IdSet {
         .unwrap_or_default()
 }
 
+fn to_count(lookup: Option<Lookup>) -> u64 {
+    lookup.map_or(0, |l| {
+        let mut values = l.values;
+        values.sort_unstable();
+        values.dedup();
+        values.len() as u64
+    })
+}
+
 fn to_one(lookup: Option<Lookup>) -> Option<u64> {
     lookup.and_then(|l| l.values.first().copied())
 }
@@ -101,6 +110,12 @@ impl LocalTable {
         to_set(self.writer.get(k, k2))
     }
 
+    /// The number of ids at `key`, without building the set.
+    pub fn count<K: Key>(&self, key: K) -> u64 {
+        let (k, k2) = key.parts();
+        to_count(self.writer.get(k, k2))
+    }
+
     /// The single id at `key` (or the first inserted, if it holds a set).
     pub fn find_one<K: Key>(&self, key: K) -> Option<u64> {
         let (k, k2) = key.parts();
@@ -146,6 +161,12 @@ impl TableReader {
     pub fn find<K: Key>(&self, key: K) -> IdSet {
         let (k, k2) = key.parts();
         to_set(self.reader.get(k, k2))
+    }
+
+    /// The number of ids at `key`, without building the set.
+    pub fn count<K: Key>(&self, key: K) -> u64 {
+        let (k, k2) = key.parts();
+        to_count(self.reader.get(k, k2))
     }
 
     /// The single id at `key` (or the first inserted, if it holds a set).
@@ -198,16 +219,20 @@ mod tests {
         t.insert(1u64, [3, 1]).unwrap();
         t.insert(1u64, []).unwrap();
         assert_eq!(t.find(1u64), set(&[1, 3, 5, 9]));
+        assert_eq!(t.count(1u64), 4);
+        assert_eq!(t.reader().count(1u64), 4);
 
         // More than fit in one dynamic table operation, with duplicates.
         let many: Vec<u64> = (1..=100).rev().chain(1..=50).collect();
         t.insert(2u64, many).unwrap();
         assert_eq!(t.find(2u64), (1..=100).collect());
+        assert_eq!(t.count(2u64), 100);
         assert_eq!(t.find_one(2u64), Some(1));
 
         t.delete(1u64).unwrap();
         assert!(t.find(1u64).is_empty());
         assert_eq!(t.find_one(1u64), None);
+        assert_eq!(t.count(1u64), 0);
 
         assert!(matches!(
             t.insert(0u64, [1]),

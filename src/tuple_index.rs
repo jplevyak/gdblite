@@ -273,6 +273,13 @@ pub fn find_links(local: &Local, linkage: Linkage, id: u64) -> IdSet {
         .find(id)
 }
 
+/// The number of links with `id` at `linkage`.
+pub fn count_links(local: &Local, linkage: Linkage, id: u64) -> u64 {
+    local
+        .table(BuiltinIndex::for_linkage(linkage).table())
+        .count(id)
+}
+
 /// The value holding `data`.
 pub fn find_value(local: &Local, data: &[u8]) -> Option<u64> {
     find_value_by_uuid(local, Uuid::of(data))
@@ -307,6 +314,18 @@ pub fn find_links_by_intersection(
     local
         .table(intersection.index().table())
         .find(intersection_key(x, y))
+}
+
+/// The number of links with `x` and `y` at the linkages of `intersection`.
+pub fn count_links_by_intersection(
+    local: &Local,
+    intersection: Intersection,
+    x: u64,
+    y: u64,
+) -> u64 {
+    local
+        .table(intersection.index().table())
+        .count(intersection_key(x, y))
 }
 
 /// The latest link with `x` and `y` at the linkages of `intersection`.

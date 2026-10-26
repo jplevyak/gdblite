@@ -50,10 +50,17 @@
 //! After a crash or [`rollback`](Graph::rollback) the indexes may still name
 //! entries that were lost, which the log has replaced with filler nodes, so
 //! the graph checks what the ids it finds name.
+//!
+//! # Statistics
+//!
+//! The graph keeps [`Stats`] of its links for estimating query costs, saved
+//! to `{prefix}stats` by [`tick`](Graph::tick) and when the graph is dropped.
+//! Opening a graph counts the entries committed since they were last saved,
+//! or all of them if they were never saved.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 pub use crate::local::Options;
@@ -62,6 +69,7 @@ use crate::local_record_log::{self, Records};
 use crate::local_table::IdSet;
 use crate::record::{Link, LinkFields, LinkState, Linkage, Record, now};
 use crate::record_log::Entry;
+use crate::stats::{self, Stats};
 use crate::tuple_index::{self, Intersection, NUM_BUILTIN_INDEXES};
 
 /// The data of the value that is the predicate of key links.
@@ -120,6 +128,12 @@ impl From<local_record_log::Error> for Error {
     }
 }
 
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Local(local::Error::Io(e))
+    }
+}
+
 impl From<tuple_index::Error> for Error {
     fn from(e: tuple_index::Error) -> Self {
         Error::Index(e)
@@ -151,9 +165,26 @@ pub struct Imported {
     pub skipped: Vec<(u64, Error)>,
 }
 
+/// Whether a graph exists at `prefix`.
+pub fn exists(prefix: &Path) -> bool {
+    local::exists(prefix)
+}
+
+/// Deletes the graph at `prefix`.
+pub fn remove(prefix: &Path) -> io::Result<()> {
+    local::remove(prefix)?;
+    stats::remove(prefix)
+}
+
 /// A graph database; see the [module](self) docs.
 pub struct Graph {
     local: Local,
+    /// The statistics of every entry appended.
+    stats: Stats,
+    /// The statistics of the committed entries.
+    committed: Stats,
+    /// The id the saved statistics cover entries before.
+    saved_id: u64,
 }
 
 impl Graph {
@@ -161,8 +192,27 @@ impl Graph {
     /// in-memory graph if `prefix` is `None`.
     pub fn open(prefix: Option<&Path>, mut options: Options) -> Result<Self> {
         options.tables = options.tables.max(NUM_BUILTIN_INDEXES);
+        Self::with_stats(Local::open(prefix, options)?)
+    }
+
+    /// The graph of `local`, loading its statistics and counting the entries
+    /// they do not cover.
+    fn with_stats(local: Local) -> Result<Self> {
+        let log = local.log();
+        let meta = log.metadata();
+        let loaded = local
+            .prefix()
+            .and_then(|p| stats::load(p, meta.uuid))
+            .filter(|&(_, id)| (log.start_id()..=meta.next_id).contains(&id));
+        let (mut stats, saved_id) = loaded.unwrap_or_else(|| (Stats::default(), log.start_id()));
+        for record in log.records(saved_id) {
+            stats.add(&record?);
+        }
         Ok(Graph {
-            local: Local::open(prefix, options)?,
+            local,
+            committed: stats.clone(),
+            stats,
+            saved_id,
         })
     }
 
@@ -174,9 +224,7 @@ impl Graph {
         input: &mut impl Read,
     ) -> Result<Self> {
         options.tables = options.tables.max(NUM_BUILTIN_INDEXES);
-        Ok(Graph {
-            local: Local::restore(prefix, options, input)?,
-        })
+        Self::with_stats(Local::restore(prefix, options, input)?)
     }
 
     /// Writes a snapshot of the graph, including entries not yet committed,
@@ -187,13 +235,17 @@ impl Graph {
 
     /// Makes the appended entries durable.
     pub fn commit(&mut self) -> Result<()> {
-        Ok(self.local.commit()?)
+        self.local.commit()?;
+        self.committed.clone_from(&self.stats);
+        Ok(())
     }
 
     /// Discards the entries appended since the last commit.  Their ids are not
     /// reused.
     pub fn rollback(&mut self) -> Result<()> {
-        Ok(self.local.log_mut().abandon_commit()?)
+        self.local.log_mut().abandon_commit()?;
+        self.stats.clone_from(&self.committed);
+        Ok(())
     }
 
     /// Runs `f`, then commits if it succeeds or rolls back if it fails.
@@ -212,9 +264,28 @@ impl Graph {
         }
     }
 
-    /// Does periodic maintenance on the indexes.
+    /// Does periodic maintenance on the indexes, and saves the statistics.
     pub fn tick(&mut self) -> Result<()> {
-        Ok(self.local.tick()?)
+        self.local.tick()?;
+        self.save_stats()
+    }
+
+    /// Saves the statistics of the committed entries, if they have changed.
+    pub fn save_stats(&mut self) -> Result<()> {
+        let meta = self.local.log().metadata();
+        if let Some(prefix) = self.local.prefix()
+            && meta.next_id != self.saved_id
+        {
+            stats::save(prefix, meta.uuid, meta.next_id, &self.committed)?;
+            self.saved_id = meta.next_id;
+        }
+        Ok(())
+    }
+
+    /// The statistics of the graph's links, including those not yet
+    /// committed.
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     pub fn is_transient(&self) -> bool {
@@ -268,6 +339,7 @@ impl Graph {
     fn append(&mut self, record: &Record<'_>) -> Result<u64> {
         self.local.log_mut().append(record)?;
         tuple_index::index_records(&mut self.local, std::slice::from_ref(record))?;
+        self.stats.add(record);
         Ok(record.id())
     }
 
@@ -604,6 +676,33 @@ impl Graph {
         links
     }
 
+    /// The number of links, live or dead, with `id` at `linkage` (any of
+    /// their subgraphs, for `Subgraph`).  It may count links lost in a crash,
+    /// so it is an upper bound.  It reads the ids but does not build a set.
+    pub fn link_count(&self, linkage: Linkage, id: u64) -> u64 {
+        if linkage == Linkage::When {
+            return 0;
+        }
+        tuple_index::count_links(&self.local, linkage, id)
+    }
+
+    /// The number of links, live or dead, with `predicate` and `id` at
+    /// `linkage`, which must be `Subject` or `Object`; an upper bound like
+    /// [`link_count`](Self::link_count).
+    pub fn property_count(&self, id: u64, linkage: Linkage, predicate: u64) -> Result<u64> {
+        let (intersection, x, y) = match linkage {
+            Linkage::Subject => (Intersection::SubjectPredicate, id, predicate),
+            Linkage::Object => (Intersection::PredicateObject, predicate, id),
+            _ => return Err(Error::InvalidArgument("linkage must be subject or object")),
+        };
+        Ok(tuple_index::count_links_by_intersection(
+            &self.local,
+            intersection,
+            x,
+            y,
+        ))
+    }
+
     /// The links of `links` that are the latest, live link of their SPO
     /// among those appended by `as_of` (or at all, if `None`).  `links` must
     /// hold every such link of each SPO it holds.
@@ -722,6 +821,12 @@ impl Graph {
         let latest = *links.last()?;
         self.with_link(latest, |l| l.get(output))
             .filter(|&v| v != 0)
+    }
+}
+
+impl Drop for Graph {
+    fn drop(&mut self) {
+        let _ = self.save_stats();
     }
 }
 

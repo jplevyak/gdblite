@@ -512,3 +512,115 @@ fn import_errors() {
     assert!(matches!(err, Err(Error::Unresolved(id)) if id == base + 5));
     assert_eq!(g.links_at(Linkage::Predicate, [p]), links);
 }
+
+#[test]
+fn stats_and_counts() {
+    let mut g = graph();
+    let (a, b, c) = (g.node().unwrap(), g.node().unwrap(), g.node().unwrap());
+    let (knows, likes) = (g.value(b"knows").unwrap(), g.value(b"likes").unwrap());
+    g.link(a, knows, b).unwrap();
+    g.link(a, knows, c).unwrap();
+    g.link(b, knows, c).unwrap();
+    g.link(a, likes, b).unwrap();
+    g.link(a, likes, b).unwrap(); // a duplicate, not appended
+    g.delete_link(a, knows, b).unwrap();
+
+    let s = g.stats();
+    let k = s.predicate(knows).unwrap();
+    assert_eq!((k.links, k.dead, k.live()), (4, 1, 2));
+    assert_eq!((k.subjects.len(), k.objects.len()), (2, 2));
+    assert_eq!(k.per_subject(), 1.0);
+    let l = s.predicate(likes).unwrap();
+    assert_eq!((l.links, l.dead, l.live()), (1, 0, 1));
+    assert!(s.predicate(a).is_none());
+    assert_eq!((s.links(), s.dead(), s.live()), (5, 1, 3));
+    assert_eq!(s.predicate_count(), 2);
+
+    // Counts include dead links.
+    assert_eq!(g.link_count(Linkage::Subject, a), 4);
+    assert_eq!(g.link_count(Linkage::Predicate, knows), 4);
+    assert_eq!(g.link_count(Linkage::Object, c), 2);
+    assert_eq!(g.link_count(Linkage::When, a), 0);
+    assert_eq!(g.property_count(a, Linkage::Subject, knows).unwrap(), 3);
+    assert_eq!(g.property_count(c, Linkage::Object, knows).unwrap(), 2);
+    assert_eq!(g.property_count(c, Linkage::Subject, knows).unwrap(), 0);
+    assert!(g.property_count(a, Linkage::Author, knows).is_err());
+}
+
+#[test]
+fn stats_rollback() {
+    let mut g = graph();
+    let (a, p) = (g.node().unwrap(), g.value(b"p").unwrap());
+    g.link(a, p, a).unwrap();
+    g.commit().unwrap();
+    let before = g.stats().clone();
+    let err = g.batch(|g| {
+        let b = g.node()?;
+        g.link(a, p, b)?;
+        Err::<(), _>(Error::InvalidArgument("give up"))
+    });
+    assert!(err.is_err());
+    assert_eq!(g.stats(), &before);
+}
+
+#[test]
+fn stats_persist() {
+    let dir = TempDir::new("stats");
+    let prefix = dir.prefix("g");
+    let build = |g: &mut Graph, n: u64| {
+        let p = g.value(format!("p{}", n % 3).as_bytes()).unwrap();
+        let (s, o) = (g.node().unwrap(), g.value(&n.to_le_bytes()).unwrap());
+        g.link(s, p, o).unwrap();
+    };
+
+    let mut g = Graph::open(Some(&prefix), Options::default()).unwrap();
+    (0..100).for_each(|n| build(&mut g, n));
+    g.commit().unwrap();
+    g.tick().unwrap();
+    let old_file = fs::read(stats::path(&prefix)).unwrap();
+    (100..200).for_each(|n| build(&mut g, n));
+    g.commit().unwrap();
+    let committed = g.stats().clone();
+    assert_eq!(committed.links(), 200);
+    // Uncommitted links are lost, and not counted.
+    build(&mut g, 200);
+    drop(g);
+
+    let g = Graph::open(Some(&prefix), Options::default()).unwrap();
+    assert_eq!(g.stats(), &committed);
+    drop(g);
+
+    // Stale statistics are caught up.
+    fs::write(stats::path(&prefix), &old_file).unwrap();
+    let g = Graph::open(Some(&prefix), Options::default()).unwrap();
+    assert_eq!(g.stats(), &committed);
+    drop(g);
+
+    // Missing or invalid statistics are recounted.
+    for contents in [
+        None,
+        Some(&b"garbage"[..]),
+        Some(&old_file[..old_file.len() - 1]),
+    ] {
+        match contents {
+            None => fs::remove_file(stats::path(&prefix)).unwrap(),
+            Some(c) => fs::write(stats::path(&prefix), c).unwrap(),
+        }
+        let g = Graph::open(Some(&prefix), Options::default()).unwrap();
+        assert_eq!(g.stats(), &committed);
+    }
+
+    // A restored graph counts its entries.
+    let mut snapshot = Vec::new();
+    Graph::open(Some(&prefix), Options::default())
+        .unwrap()
+        .snapshot(&mut snapshot)
+        .unwrap();
+    let restored = Graph::restore(None, Options::default(), &mut &snapshot[..]).unwrap();
+    assert_eq!(restored.stats(), &committed);
+
+    assert!(exists(&prefix));
+    remove(&prefix).unwrap();
+    assert!(!exists(&prefix));
+    assert!(!stats::path(&prefix).exists());
+}
